@@ -1,0 +1,14 @@
+Gladiatus Battle Simulator
+
+Upstream project: DinoDevs/GladiatusBattleSimulator
+https://github.com/DinoDevs/GladiatusBattleSimulator
+
+Copyright © DinoDevs / Gladiatus Crazy Team; authors GramThanos and GreatApo.
+The upstream GladiatusBattleSimulator repository is licensed under GNU Lesser General Public License v2.1 (LGPL-2.1).
+
+This Gladiatus Assistant distribution contains a modified JavaScript port of the Arena simulator logic.
+Modified files:
+- engine/combat-simulator.js
+Modification date: 2026-09-25.
+
+The corresponding LGPL-2.1 text is included in LICENSE-LGPL-2.1.txt.

@@ -1,0 +1,37 @@
+{
+  "manifest_version": 2,
+  "name": "Gladiatus Assistant",
+  "version": "0.5.51",
+  "description": "Persistent on-page Gladiatus character-profile capture with multi-character stats, roles, equipment and passive stat refresh, auction analyzer, passive expedition, Provinciarum Arena and Circus combat recorder, development-only Auto Expedition, Auto Arena and Auto Circus Provinciarum collectors with 5v5 opponent simulation and win-rate target selection, simplified Auto Combat dispatcher using global header cooldowns with configurable pre-click humanization delay and HP safety with automatic healing from a configured inventory page, DinoDevs-based LGPL-2.1 Arena and Circus Turma combat simulators, hypothetical equipment/stat simulation, and captured enemy profiles, plus mode-aware simulator-driven stat-upgrade priority analysis, manual combat-stat adjustment analysis, and simulator-based auction equipment comparison, cached Gladiatus Fansite prefix and suffix auction filters, with Circus Provinciarum stale-action recovery.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "<all_urls>",
+    "https://*.gladiatus.gameforge.com/*"
+  ],
+  "content_security_policy": "script-src 'self'; object-src 'self'; img-src 'self' data: https:",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.gladiatus.gameforge.com/*"
+      ],
+      "js": [
+        "content/page-detector.js",
+        "content/gladiatus-parser.js",
+        "content/PacedNav.js",
+        "engine/combat-simulator.js",
+        "content/assistant-overlay.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "scripts": [
+      "background/service-worker.js"
+    ],
+    "persistent": true
+  },
+  "browser_action": {
+    "default_title": "Gladiatus Assistant"
+  }
+}
