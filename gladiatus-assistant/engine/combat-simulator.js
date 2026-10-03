@@ -166,25 +166,34 @@
 
   function deriveTrainableStat(input, key, itemTotals) {
     const base = baseStat(input, key);
+    const maximum = numberOrNull(input?.statDetails?.[key]?.max);
     if (base.value == null) {
       const displayed = displayedStat(input?.stats || input?.displayedStats, key);
       return {
         value: displayed,
         source: displayed == null ? "unavailable" : "displayed",
         base: null,
+        max: maximum,
         itemFlat: finite(itemTotals?.[key]?.flat),
-        itemPercent: finite(itemTotals?.[key]?.percent)
+        itemPercent: finite(itemTotals?.[key]?.percent),
+        capped: false
       };
     }
     const mod = itemTotals?.[key] || modifier();
     const continuous = (base.value + mod.flat) * (1 + mod.percent / 100);
+    const rounded = Math.round(continuous);
+    const capped = maximum != null && rounded > maximum;
+    const value = capped ? maximum : rounded;
     return {
-      value: Math.round(continuous),
+      value,
       continuous,
-      source: "base+items",
+      rounded,
+      source: capped ? "base+items+capped" : "base+items",
       base: base.value,
+      max: maximum,
       itemFlat: mod.flat,
-      itemPercent: mod.percent
+      itemPercent: mod.percent,
+      capped
     };
   }
 
@@ -272,15 +281,30 @@
     const derived = {};
     const sources = {};
 
+    const statMaximums = {};
+    const statProjectionDetails = {};
     for (const key of TRAINABLE) {
+      const maximum = numberOrNull(statDetails?.[key]?.max);
+      if (maximum != null) statMaximums[key] = maximum;
       const displayed = !recalculateDerived ? displayedStat(stats, key) : null;
       if (displayed != null) {
         derived[key] = displayed;
         sources[key] = "displayed";
+        statProjectionDetails[key] = { value: displayed, max: maximum, capped: maximum != null && displayed >= maximum };
       } else {
         const projected = deriveTrainableStat(input, key, itemData.totals);
         derived[key] = projected.value;
         sources[key] = projected.source;
+        statProjectionDetails[key] = {
+          value: projected.value,
+          continuous: projected.continuous ?? null,
+          rounded: projected.rounded ?? projected.value ?? null,
+          base: projected.base,
+          max: projected.max,
+          itemFlat: projected.itemFlat,
+          itemPercent: projected.itemPercent,
+          capped: !!projected.capped
+        };
       }
     }
 
@@ -406,6 +430,8 @@
         honour_veteran: !!stats?.buffs?.honour_veteran,
         honour_destroyer: !!stats?.buffs?.honour_destroyer
       },
+      statMaximums: statMaximums,
+      statProjectionDetails,
       baselines: {
         damageRange: baseDamage || null,
         armour: baseArmour != null ? finite(baseArmour) : ((displayedArmour != null && recalculateDerived) ? (() => {

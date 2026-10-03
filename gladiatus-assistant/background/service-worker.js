@@ -162,7 +162,7 @@
     // The persistent on-page Assistant is a content script, so runtime.sendMessage
     // reaches this background context but not the parser content script. Route
     // parser commands back to the sender's Gladiatus tab explicitly.
-    if (["PING", "DISCOVER_CHARACTER_DOLLS", "CAPTURE_CHARACTER_PROFILE", "SCAN_EQUIPMENT", "SCAN_AUCTION", "QUICK_EQUIPMENT"].includes(message?.type)) {
+    if (["PING", "DISCOVER_CHARACTER_DOLLS", "CAPTURE_CHARACTER_PROFILE", "SCAN_EQUIPMENT", "SCAN_AUCTION", "SCAN_VISIBLE_EQUIPMENT_COMPARISON", "QUICK_EQUIPMENT"].includes(message?.type)) {
       const tabId = sender?.tab?.id;
       if (tabId == null) {
         sendResponse({ ok: false, error: "No Gladiatus tab was supplied for parser routing." });

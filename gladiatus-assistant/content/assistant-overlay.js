@@ -2,7 +2,7 @@
   "use strict";
 
   const api = globalThis.browser || globalThis.chrome;
-  const VERSION = "0.5.51";
+  const VERSION = "0.5.72";
   const STORAGE_KEY_PREFIX = "equipment:v0.2.5.9:";
   const OVERLAY_STATE_PREFIX = "overlay:v0.2.5.10:";
   const ACTIVE_TAB_PREFIX = "active-tab:v0.3.5:";
@@ -245,11 +245,29 @@
   let arenaCombatStore = null;
   let arenaOpponentAnalysisStore = { schemaVersion: 2, updatedAt: null, setSignature: null, playerProfile: null, opponents: {} };
   let arenaAnalysisBusy = false;
+  let arenaAnalysisPromise = null;
   let circusProvinciarumAutomationState = null;
   let circusProvinciarumAutomationTimer = null;
   let circusProvinciarumAutomationBusy = false;
   let circusProvinciarumAnalysisStore = { schemaVersion: 1, updatedAt: null, setSignature: null, playerProfile: null, opponents: {} };
   let circusProvinciarumAnalysisBusy = false;
+  let circusProvinciarumAnalysisPromise = null;
+  let nativeOpponentWinRateObserver = null;
+  let nativeOpponentWinRateRenderTimer = null;
+  let nativeOpponentWinRateAutoAnalysisTimer = null;
+  let nativeOpponentWinRateAutoAnalysisReady = false;
+  let nativeAuctionComparisonObserver = null;
+  let nativeAuctionComparisonRenderTimer = null;
+  let nativeAuctionComparisonListenersReady = false;
+  let nativeEquipmentComparisonObserver = null;
+  let nativeEquipmentComparisonScanTimer = null;
+  let nativeEquipmentComparisonScanInFlight = false;
+  let nativeEquipmentComparisonScanGeneration = 0;
+  let nativeEquipmentComparisonCandidates = new Map();
+  let nativeEquipmentComparisonListenersReady = false;
+  let nativeItemTooltipHoveredElement = null;
+  let nativeItemTooltipHoveredKey = "";
+  let nativeItemTooltipRenderTimer = null;
   let circusCombatStore = null;
   let dungeonCombatStore = null;
   let dungeonReportWaitStartedAt = 0;
@@ -1063,123 +1081,92 @@
   function validateCombatRecord(record) {
     const errors = [];
     const warnings = [];
+    const reportType = String(record?.reportType || "").toLowerCase();
+    const isCircus = reportType === "circus";
     if (!record?.reportId) errors.push("Missing report ID");
-    if (!(["expedition", "arena"].includes(String(record?.reportType || "")))) errors.push("Unsupported combat report type");
-    if (!record?.participants?.attacker?.name) errors.push("Missing attacker name");
-    if (!record?.participants?.defender?.name) errors.push("Missing defender name");
-    if (!record?.participants?.attacker?.rawRows?.length) errors.push("Missing attacker stat rows");
-    if (!record?.participants?.defender?.rawRows?.length) errors.push("Missing defender stat rows");
-    if (!record?.reward) warnings.push("Reward section missing");
-    if (!Array.isArray(record?.damageSummary) || record.damageSummary.length < 2) warnings.push("Damage summary incomplete");
+    if (!(isCircus || ["expedition", "arena"].includes(reportType))) errors.push("Unsupported combat report type");
+    if (isCircus) {
+      if (!Array.isArray(record?.participants?.attackers) || record.participants.attackers.length !== 5) errors.push(`Invalid Circus attacker team (${record?.participants?.attackers?.length || 0}/5)`);
+      if (!Array.isArray(record?.participants?.defenders) || record.participants.defenders.length !== 5) errors.push(`Invalid Circus defender team (${record?.participants?.defenders?.length || 0}/5)`);
+      if (Array.isArray(record?.participants?.attackers) && record.participants.attackers.some(f => (f?.rawRows?.length || 0) < 8)) errors.push("Incomplete Circus attacker stats");
+      if (Array.isArray(record?.participants?.defenders) && record.participants.defenders.some(f => (f?.rawRows?.length || 0) < 8)) errors.push("Incomplete Circus defender stats");
+    } else {
+      if (!record?.participants?.attacker?.name) errors.push("Missing attacker name");
+      if (!record?.participants?.defender?.name) errors.push("Missing defender name");
+      if (!record?.participants?.attacker?.rawRows?.length) errors.push("Missing attacker stat rows");
+      if (!record?.participants?.defender?.rawRows?.length) errors.push("Missing defender stat rows");
+    }
+    if (!record?.reward && !isCircus) warnings.push("Reward section missing");
+    if (!Array.isArray(record?.damageSummary) || record.damageSummary.length < (isCircus ? 10 : 2)) warnings.push(`Damage summary incomplete${isCircus ? ` (${record?.damageSummary?.length || 0}/10)` : ""}`);
     if (!Array.isArray(record?.rounds) || record.rounds.length === 0) errors.push("No combat rounds captured");
     if (!record?.totalEvents) errors.push("No combat events captured");
     if (!record?.outcome || record.outcome.type === "unknown" || !record.outcome.winner) warnings.push("Final result is unknown");
-
     const roundNumbers = [];
     const sequences = [];
-    let eventCount = 0;
-    let damageEvents = 0;
-    let missEvents = 0;
-    let criticalEvents = 0;
-    let otherEvents = 0;
+    let eventCount = 0, damageEvents = 0, missEvents = 0, criticalEvents = 0, otherEvents = 0;
     for (const round of record.rounds || []) {
-      if (!Number.isFinite(Number(round?.round))) errors.push("Invalid round number");
-      else roundNumbers.push(Number(round.round));
+      if (!Number.isFinite(Number(round?.round))) errors.push("Invalid round number"); else roundNumbers.push(Number(round.round));
       for (const event of round?.events || []) {
         eventCount++;
         if (Number.isFinite(Number(event?.sequence))) sequences.push(Number(event.sequence));
-        if (event?.resultType === "damage") damageEvents++;
-        else if (event?.resultType === "miss") missEvents++;
-        else otherEvents++;
+        if (event?.resultType === "damage") damageEvents++; else if (event?.resultType === "miss") missEvents++; else otherEvents++;
         if (event?.critical) criticalEvents++;
         if (!event?.attacker || !event?.target) warnings.push("Event missing attacker or target");
       }
     }
     if (eventCount !== Number(record.totalEvents)) warnings.push(`Event count mismatch: stored ${record.totalEvents}, counted ${eventCount}`);
     if (sequences.length) {
-      const sorted = [...sequences].sort((a, b) => a - b);
-      for (let i = 0; i < sorted.length; i++) {
-        if (sorted[i] !== i) { warnings.push("Event sequence is not contiguous"); break; }
-      }
+      const sorted = [...sequences].sort((a,b)=>a-b);
+      for (let i=0;i<sorted.length;i++) if (sorted[i] !== i) { warnings.push("Event sequence is not contiguous"); break; }
       if (new Set(sequences).size !== sequences.length) warnings.push("Duplicate event sequence numbers");
     }
     if (otherEvents) warnings.push(`${otherEvents} event(s) have an unclassified result type`);
     if (roundNumbers.length && new Set(roundNumbers).size !== roundNumbers.length) warnings.push("Duplicate round numbers");
-
     const expectedCapture = record.captureDiagnostics || {};
-    const validation = {
+    return {
       ready: errors.length === 0,
-      errors: [...new Set(errors)],
-      warnings: [...new Set(warnings)],
+      errors: [...new Set(errors)], warnings: [...new Set(warnings)],
       counts: {
-        rounds: Array.isArray(record.rounds) ? record.rounds.length : 0,
-        events: eventCount,
-        damageEvents,
-        missEvents,
-        criticalEvents,
-        otherEvents,
+        rounds: Array.isArray(record.rounds) ? record.rounds.length : 0, events: eventCount,
+        damageEvents, missEvents, criticalEvents, otherEvents,
         damageSummaryRows: Array.isArray(record.damageSummary) ? record.damageSummary.length : 0,
-        attackerStatsRows: record.participants?.attacker?.rawRows?.length || 0,
-        defenderStatsRows: record.participants?.defender?.rawRows?.length || 0
+        attackerStatsRows: isCircus ? (record.participants?.attackers || []).reduce((sum,f)=>sum+(f?.rawRows?.length||0),0) : (record.participants?.attacker?.rawRows?.length||0),
+        defenderStatsRows: isCircus ? (record.participants?.defenders || []).reduce((sum,f)=>sum+(f?.rawRows?.length||0),0) : (record.participants?.defender?.rawRows?.length||0)
       },
       readinessAtCapture: expectedCapture.readiness || null
     };
-    return validation;
   }
 
   function formatCombatSummary(record) {
     if (!record) return "No combat report captured.";
     const validation = validateCombatRecord(record);
-    const a = record.participants?.attacker || {};
-    const d = record.participants?.defender || {};
-    const damage = record.damageSummary || [];
-    const playerDamage = damage.find(row => row.name === a.name)?.damageDone;
-    const enemyDamage = damage.find(row => row.name === d.name)?.damageDone;
-    const playerLife = damage.find(row => row.name === a.name)?.lifeRemaining;
-    const enemyLife = damage.find(row => row.name === d.name)?.lifeRemaining;
-    const roundLines = (record.rounds || []).map(round => `  Round ${round.round}: ${(round.events || []).length} events`).join("\n");
-    const missing = validation.errors.length ? validation.errors.map(x => `  - ${x}`).join("\n") : "  None";
-    const warnings = validation.warnings.length ? validation.warnings.map(x => `  - ${x}`).join("\n") : "  None";
-    return [
+    const isCircus = String(record?.reportType || "").toLowerCase() === "circus";
+    const metrics = combatRecordMetrics(record);
+    const lines = [
       `Report ID: ${record.reportId || "unknown"}`,
-      `Type: ${record.reportType || "unknown"}`,
+      `Type: ${combatRecordTypeLabel(record)}`,
       `Captured: ${record.capturedAt || "unknown"}`,
       `Result: ${combatOutcomeLabel(record.outcome)}${record.outcome?.winner ? ` (winner: ${record.outcome.winner})` : ""}`,
-      `Result source: ${record.outcome?.source || "none"}`,
-      "",
-      `ATTACKER: ${a.name || "unknown"}`,
-      `  Level: ${a.level ?? "?"}`,
-      `  Life: ${a.lifeCurrent ?? "?"}/${a.lifeMax ?? "?"}`,
-      `  Damage: ${a.damageMin ?? "?"}–${a.damageMax ?? "?"}`,
-      `  Armour: ${a.armour ?? "?"}`,
-      `  Hit: ${a.hitChance ?? "?"}% | Double hit: ${a.doubleHit ?? "?"}% | Crit: ${a.criticalChance ?? "?"}% | Block: ${a.blockChance ?? "?"}%`,
-      "",
-      `DEFENDER: ${d.name || "unknown"}`,
-      `  Level: ${d.level ?? "?"}`,
-      `  Life: ${d.lifeCurrent ?? "?"}/${d.lifeMax ?? "?"}`,
-      `  Damage: ${d.damageMin ?? "?"}–${d.damageMax ?? "?"}`,
-      `  Armour: ${d.armour ?? "?"}`,
-      `  Hit: ${d.hitChance ?? "?"}% | Double hit: ${d.doubleHit ?? "?"}% | Crit: ${d.criticalChance ?? "?"}% | Block: ${d.blockChance ?? "?"}%`,
-      "",
-      "REWARD",
-      `  Gold: ${record.reward?.gold ?? "?"}`,
-      `  Experience: ${record.reward?.experience ?? "?"}`,
-      `  Honour: ${record.reward?.honour ?? "?"}`,
-      "",
-      "DAMAGE SUMMARY",
-      `  ${a.name || "Attacker"}: ${playerDamage ?? "?"} damage | ${playerLife ?? "?"} life remaining`,
-      `  ${d.name || "Defender"}: ${enemyDamage ?? "?"} damage | ${enemyLife ?? "?"} life remaining`,
-      "",
-      `ROUND / EVENT COUNTS: ${record.rounds?.length || 0} rounds | ${record.totalEvents || 0} events`,
-      roundLines || "  None",
-      "",
-      "VALIDATION",
-      `  Ready: ${validation.ready ? "YES" : "NO"}`,
-      `  Errors:
-${missing}`,
-      `  Warnings:
-${warnings}`
-    ].join("\n");
+      `Result source: ${record.outcome?.source || "none"}`, ""
+    ];
+    if (isCircus) {
+      lines.push("ATTACKERS:");
+      for (const fighter of record.participants?.attackers || []) lines.push(`  ${fighter?.name || "unknown"} · Lv ${fighter?.level ?? "?"} · HP ${fighter?.lifeCurrent ?? "?"}/${fighter?.lifeMax ?? "?"}`);
+      lines.push("", "DEFENDERS:");
+      for (const fighter of record.participants?.defenders || []) lines.push(`  ${fighter?.name || "unknown"} · Lv ${fighter?.level ?? "?"} · HP ${fighter?.lifeCurrent ?? "?"}/${fighter?.lifeMax ?? "?"}`);
+      const aNames = new Set((record.participants?.attackers || []).map(f=>normalize(f?.name || "")).filter(Boolean));
+      const dNames = new Set((record.participants?.defenders || []).map(f=>normalize(f?.name || "")).filter(Boolean));
+      const aRows = (record.damageSummary || []).filter(row=>aNames.has(normalize(row?.name || "")));
+      const dRows = (record.damageSummary || []).filter(row=>dNames.has(normalize(row?.name || "")));
+      lines.push("", "DAMAGE SUMMARY", `  Attacker team: ${metrics.playerDamageSummary ?? metrics.playerDamage} damage · ${metrics.playerLifeRemaining ?? "?"} total HP remaining`, `  Defender team: ${metrics.enemyDamageSummary ?? metrics.enemyDamage} damage · ${metrics.enemyLifeRemaining ?? "?"} total HP remaining`, `  Summary rows: ${aRows.length} attacker / ${dRows.length} defender`);
+    } else {
+      const a = record.participants?.attacker || {}; const d = record.participants?.defender || {};
+      const damage = record.damageSummary || [];
+      const pa = damage.find(row=>row.name===a.name); const pd = damage.find(row=>row.name===d.name);
+      lines.push(`ATTACKER: ${a.name || "unknown"}`, `  Level: ${a.level ?? "?"}`, `  Life: ${a.lifeCurrent ?? "?"}/${a.lifeMax ?? "?"}`, `  Damage: ${a.damageMin ?? "?"}–${a.damageMax ?? "?"}`, `  Armour: ${a.armour ?? "?"}`, `  Hit: ${a.hitChance ?? "?"}% | Double hit: ${a.doubleHit ?? "?"}% | Crit: ${a.criticalChance ?? "?"}% | Block: ${a.blockChance ?? "?"}%`, "", `DEFENDER: ${d.name || "unknown"}`, `  Level: ${d.level ?? "?"}`, `  Life: ${d.lifeCurrent ?? "?"}/${d.lifeMax ?? "?"}`, `  Damage: ${d.damageMin ?? "?"}–${d.damageMax ?? "?"}`, `  Armour: ${d.armour ?? "?"}`, `  Hit: ${d.hitChance ?? "?"}% | Double hit: ${d.doubleHit ?? "?"}% | Crit: ${d.criticalChance ?? "?"}% | Block: ${d.blockChance ?? "?"}%`, "", "REWARD", `  Gold: ${record.reward?.gold ?? "?"}`, `  Experience: ${record.reward?.experience ?? "?"}`, `  Honour: ${record.reward?.honour ?? "?"}`, "", "DAMAGE SUMMARY", `  ${a.name || "Attacker"}: ${pa?.damageDone ?? "?"} damage | ${pa?.lifeRemaining ?? "?"} life remaining`, `  ${d.name || "Defender"}: ${pd?.damageDone ?? "?"} damage | ${pd?.lifeRemaining ?? "?"} life remaining`);
+    }
+    lines.push("", `ROUND / EVENT COUNTS: ${record.rounds?.length || 0} rounds | ${record.totalEvents || 0} events`, ...(record.rounds || []).map(round=>`  Round ${round.round}: ${(round.events||[]).length} events`), "", "VALIDATION", `  Ready: ${validation.ready ? "YES" : "NO"}`, `  Errors:\n${validation.errors.length ? validation.errors.map(x=>`  - ${x}`).join("\n") : "  None"}`, `  Warnings:\n${validation.warnings.length ? validation.warnings.map(x=>`  - ${x}`).join("\n") : "  None"}`);
+    return lines.join("\n");
   }
 
   async function copyTextWithButton(text, button, defaultLabel) {
@@ -1239,14 +1226,17 @@ ${warnings}`
   }
 
   function combatRecordMetrics(record) {
-    const attackerName = normalize(record?.participants?.attacker?.name || "");
-    const defenderName = normalize(record?.participants?.defender?.name || "");
+    const isCircus = String(record?.reportType || "").toLowerCase() === "circus";
+    const attackerNames = isCircus
+      ? new Set((record?.participants?.attackers || []).map(x => normalize(x?.name || "")).filter(Boolean))
+      : new Set([normalize(record?.participants?.attacker?.name || "")].filter(Boolean));
+    const defenderNames = isCircus
+      ? new Set((record?.participants?.defenders || []).map(x => normalize(x?.name || "")).filter(Boolean))
+      : new Set([normalize(record?.participants?.defender?.name || "")].filter(Boolean));
     const rounds = Array.isArray(record?.rounds) ? record.rounds : [];
     const events = rounds.flatMap(round => Array.isArray(round?.events) ? round.events : []);
-    const isAttacker = event => attackerName && normalize(event?.attacker || "") === attackerName;
-    const isDefender = event => defenderName && normalize(event?.attacker || "") === defenderName;
-    const playerEvents = events.filter(isAttacker);
-    const enemyEvents = events.filter(isDefender);
+    const playerEvents = events.filter(event => attackerNames.has(normalize(event?.attacker || "")));
+    const enemyEvents = events.filter(event => defenderNames.has(normalize(event?.attacker || "")));
     const playerHits = playerEvents.filter(event => event?.resultType === "damage");
     const enemyHits = enemyEvents.filter(event => event?.resultType === "damage");
     const playerMisses = playerEvents.filter(event => event?.resultType === "miss");
@@ -1258,43 +1248,39 @@ ${warnings}`
     const sumDamage = list => list.reduce((sum, event) => sum + (Number.isFinite(Number(event?.damage)) ? Number(event.damage) : 0), 0);
     const playerDamage = sumDamage(playerHits);
     const enemyDamage = sumDamage(enemyHits);
-    const hitRate = (hits, misses) => (hits + misses) ? (hits.length / (hits.length + misses.length)) * 100 : null;
     const avgHit = list => list.length ? sumDamage(list) / list.length : null;
     const maxHit = list => {
       const values = list.map(event => Number(event?.damage)).filter(Number.isFinite);
       return values.length ? Math.max(...values) : null;
     };
-    const summaryPlayer = (record?.damageSummary || []).find(row => normalize(row?.name || "") === attackerName);
-    const summaryEnemy = (record?.damageSummary || []).find(row => normalize(row?.name || "") === defenderName);
+    const summaryRowsFor = names => (record?.damageSummary || []).filter(row => names.has(normalize(row?.name || "")));
+    const summaryPlayerRows = summaryRowsFor(attackerNames);
+    const summaryEnemyRows = summaryRowsFor(defenderNames);
+    const sumSummary = (rows, key) => {
+      const values = rows.map(row => Number(row?.[key])).filter(Number.isFinite);
+      return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+    };
+    const playerDamageSummary = sumSummary(summaryPlayerRows, "damageDone");
+    const enemyDamageSummary = sumSummary(summaryEnemyRows, "damageDone");
+    const playerLifeRemaining = sumSummary(summaryPlayerRows, "lifeRemaining");
+    const enemyLifeRemaining = sumSummary(summaryEnemyRows, "lifeRemaining");
+    const playerHitDenom = playerHits.length + playerMisses.length;
+    const enemyHitDenom = enemyHits.length + enemyMisses.length;
     return {
-      rounds: rounds.length,
-      events: events.length,
-      playerAttacks: playerEvents.length,
-      playerHits: playerHits.length,
-      playerMisses: playerMisses.length,
-      playerCrits: playerCrits.length,
-      playerDoubleHits: playerDoubleHits.length,
-      playerDamage,
-      playerAvgHit: avgHit(playerHits),
-      playerMaxHit: maxHit(playerHits),
-      playerHitRate: hitRate(playerHits, playerMisses),
+      rounds: rounds.length, events: events.length,
+      playerAttacks: playerEvents.length, playerHits: playerHits.length, playerMisses: playerMisses.length,
+      playerCrits: playerCrits.length, playerDoubleHits: playerDoubleHits.length,
+      playerDamage, playerAvgHit: avgHit(playerHits), playerMaxHit: maxHit(playerHits),
+      playerHitRate: playerHitDenom ? (playerHits.length / playerHitDenom) * 100 : null,
       playerCritRate: playerHits.length ? (playerCrits.length / playerHits.length) * 100 : null,
       playerDoubleHitRate: playerEvents.length ? (playerDoubleHits.length / playerEvents.length) * 100 : null,
-      enemyAttacks: enemyEvents.length,
-      enemyHits: enemyHits.length,
-      enemyMisses: enemyMisses.length,
-      enemyCrits: enemyCrits.length,
-      enemyDoubleHits: enemyDoubleHits.length,
-      enemyDamage,
-      enemyAvgHit: avgHit(enemyHits),
-      enemyMaxHit: maxHit(enemyHits),
-      enemyHitRate: hitRate(enemyHits, enemyMisses),
+      enemyAttacks: enemyEvents.length, enemyHits: enemyHits.length, enemyMisses: enemyMisses.length,
+      enemyCrits: enemyCrits.length, enemyDoubleHits: enemyDoubleHits.length,
+      enemyDamage, enemyAvgHit: avgHit(enemyHits), enemyMaxHit: maxHit(enemyHits),
+      enemyHitRate: enemyHitDenom ? (enemyHits.length / enemyHitDenom) * 100 : null,
       enemyCritRate: enemyHits.length ? (enemyCrits.length / enemyHits.length) * 100 : null,
       enemyDoubleHitRate: enemyEvents.length ? (enemyDoubleHits.length / enemyEvents.length) * 100 : null,
-      playerDamageSummary: Number.isFinite(Number(summaryPlayer?.damageDone)) ? Number(summaryPlayer.damageDone) : null,
-      enemyDamageSummary: Number.isFinite(Number(summaryEnemy?.damageDone)) ? Number(summaryEnemy.damageDone) : null,
-      playerLifeRemaining: Number.isFinite(Number(summaryPlayer?.lifeRemaining)) ? Number(summaryPlayer.lifeRemaining) : null,
-      enemyLifeRemaining: Number.isFinite(Number(summaryEnemy?.lifeRemaining)) ? Number(summaryEnemy.lifeRemaining) : null
+      playerDamageSummary, enemyDamageSummary, playerLifeRemaining, enemyLifeRemaining
     };
   }
 
@@ -1413,6 +1399,34 @@ ${warnings}`
     const n = Number(value);
     const shown = digits === 0 ? Math.round(n).toLocaleString() : n.toFixed(digits);
     return `${shown}${suffix}`;
+  }
+
+  function combatAnalysisConfidenceBand(winRate) {
+    const n = Number(winRate);
+    if (!Number.isFinite(n)) return "Unknown";
+    if (n >= 80) return "Very high";
+    if (n >= 65) return "High";
+    if (n >= 55) return "Moderate";
+    if (n >= 50) return "Close";
+    return "Below 50%";
+  }
+
+  function combatRecordOpponentLabel(record) {
+    if (String(record?.reportType || "") === "circus") {
+      const defenders = Array.isArray(record?.participants?.defenders) ? record.participants.defenders : [];
+      const names = defenders.map(f => normalize(f?.name || "")).filter(Boolean);
+      if (!names.length) return "Unknown Circus opponent";
+      return names.length > 1 ? `${names[0]} +${names.length - 1}` : names[0];
+    }
+    return normalize(record?.participants?.defender?.name || "Unknown opponent");
+  }
+
+  function combatRecordTypeLabel(record) {
+    const type = String(record?.reportType || "").toLowerCase();
+    if (type === "circus") return "Circus 5v5";
+    if (type === "arena") return "Arena";
+    if (type === "expedition") return "Expedition";
+    return type || "Combat";
   }
 
   function combatResultClass(outcome) {
@@ -3053,7 +3067,8 @@ ${warnings}`
     if (!root) return;
     const expeditionReports = Array.isArray(combatCaptureStore?.reports) ? combatCaptureStore.reports : [];
     const arenaReports = Array.isArray(arenaCombatStore?.reports) ? arenaCombatStore.reports : [];
-    const reports = [...expeditionReports, ...arenaReports]
+    const circusReports = Array.isArray(circusCombatStore?.reports) ? circusCombatStore.reports : [];
+    const reports = [...expeditionReports, ...arenaReports, ...circusReports]
       .filter((record, index, all) => simulatorReportKey(record) && all.findIndex(item => simulatorReportKey(item) === simulatorReportKey(record)) === index)
       .sort((a, b) => String(b.capturedAt || "").localeCompare(String(a.capturedAt || "")));
     const validated = validatedCombatReports(reports);
@@ -3061,12 +3076,12 @@ ${warnings}`
       root.innerHTML = `
         <section class="ga-card" id="ga-auto-combat"></section>
         <section class="ga-card"><div class="ga-card-head"><div><h2>Combat Simulator</h2><div class="ga-muted">Capture a validated expedition or Arena battle first.</div></div></div></section>
-        <section class="ga-card"><div class="ga-card-head"><div><h2>Combat Performance</h2><div class="ga-muted">Captured expedition and Arena battles will appear here automatically.</div></div></div><div class="ga-muted" style="margin-top:8px">No combat battles captured yet.</div></section>`;
+        <section class="ga-card"><div class="ga-card-head"><div><h2>Combat Performance</h2><div class="ga-muted">Captured Expedition, Arena and Circus battles appear here automatically.</div></div></div><div class="ga-muted" style="margin-top:8px">No combat battles captured yet.</div></section>`;
       renderAutoCombatUI();
       return;
     }
 
-    const opponents = [...new Set(reports.map(record => normalize(record?.participants?.defender?.name || "Unknown opponent")))]
+    const opponents = [...new Set(reports.map(record => combatRecordOpponentLabel(record)))]
       .filter(Boolean)
       .sort((a, b) => a.localeCompare(b));
     const selectedAll = filterCombatReports(validated);
@@ -3074,16 +3089,16 @@ ${warnings}`
     const trend = combatTrendPair(selectedAll);
     const latest = selectedAll[0] || null;
     const latestMetrics = latest ? combatRecordMetrics(latest) : null;
-    const opponent = latest?.participants?.defender?.name || "Unknown opponent";
+    const opponent = latest ? combatRecordOpponentLabel(latest) : "Unknown opponent";
     const resultLabel = latest ? combatOutcomeLabel(latest.outcome) : "No matching battles";
     const resultClass = combatResultClass(resultLabel);
     const historyRows = selectedAll.slice(0, 50).map((record, index) => {
       const recordMetrics = combatRecordMetrics(record);
-      const enemy = record?.participants?.defender?.name || "Unknown opponent";
+      const enemy = combatRecordOpponentLabel(record);
       const result = combatOutcomeLabel(record?.outcome);
       const date = record?.capturedAt ? new Date(record.capturedAt).toLocaleString() : "Unknown time";
       return `<button class="ga-combat-history-row" type="button" data-combat-history-index="${index}">
-        <span class="ga-combat-history-main"><strong>${esc(enemy)}</strong><small>${esc(date)} · ${recordMetrics.rounds} rounds</small></span>
+        <span class="ga-combat-history-main"><strong>${esc(enemy)}</strong><small>${esc(combatRecordTypeLabel(record))} · ${esc(date)} · ${recordMetrics.rounds} rounds</small></span>
         <span class="ga-combat-history-result ${combatResultClass(result)}">${esc(result)}</span>
         <span class="ga-combat-history-values"><span>${formatCombatMetric(recordMetrics.playerDamageSummary ?? recordMetrics.playerDamage, 0)}</span><span>${formatCombatMetric(recordMetrics.enemyDamageSummary ?? recordMetrics.enemyDamage, 0)}</span></span>
       </button>`;
@@ -3132,7 +3147,7 @@ ${warnings}`
 
       <section class="ga-card">
         <div class="ga-card-head">
-          <div><h2>Latest Selected Expedition</h2><div class="ga-muted">${esc(opponent)} · ${esc(resultLabel)} · ${latestMetrics ? `${latestMetrics.rounds} rounds` : "No matching battle"}</div></div>
+          <div><h2>Latest Selected Battle</h2><div class="ga-muted">${esc(opponent)} · ${esc(resultLabel)} · ${latestMetrics ? `${latestMetrics.rounds} rounds` : "No matching battle"}</div></div>
           ${latest ? `<span class="ga-combat-result ${resultClass}">${esc(resultLabel)}</span>` : ""}
         </div>
         ${latest ? `<div class="ga-stats-grid ga-combat-metrics-grid" style="margin-top:8px">
@@ -3258,11 +3273,15 @@ ${warnings}`
 
   async function clearCombatData() {
     try { await storageRemove(combatKey()); } catch (_) {}
+    try { await storageRemove(arenaCombatKey()); } catch (_) {}
+    try { await storageRemove(circusCombatKey()); } catch (_) {}
     combatCaptureStore = { schemaVersion: 3, reports: [], updatedAt: null };
+    arenaCombatStore = { schemaVersion: 1, reports: [], updatedAt: null };
+    circusCombatStore = { schemaVersion: 1, reports: [], updatedAt: null };
     renderCombatCaptureStatus();
     renderCombatTab();
     renderStatPriorityTab();
-    if (statusEl) statusEl.textContent = "Captured expedition battles cleared.";
+    if (statusEl) statusEl.textContent = "Captured combat battles cleared.";
   }
 
   async function captureExpeditionCombatReport() {
@@ -3325,7 +3344,7 @@ ${warnings}`
           durabilityEvents: eventData.rounds.reduce((sum, round) => sum + round.events.filter(event => event.durabilityLosses?.length).length, 0),
           readiness,
           repairedUnknownOutcome: !!existing && existing.outcome?.type === "unknown",
-          captureCompleteness: readiness.complete ? "complete" : "core-only"
+          captureCompleteness: readiness.missingOptional?.length ? "result-only" : "complete"
         },
         source: {
           referrerKind: reportPageReferrerKind(),
@@ -3429,27 +3448,24 @@ ${warnings}`
   }
 
   function deriveCircusOutcome(attackers, defenders, damageSummary) {
-    const aNames = new Set((attackers || []).map(x => x?.name).filter(Boolean));
-    const dNames = new Set((defenders || []).map(x => x?.name).filter(Boolean));
-    const attackerRows = (damageSummary || []).filter(row => aNames.has(row.name));
-    const defenderRows = (damageSummary || []).filter(row => dNames.has(row.name));
-    const attackerAlive = attackerRows.filter(row => Number(row.lifeRemaining) > 0).length;
-    const defenderAlive = defenderRows.filter(row => Number(row.lifeRemaining) > 0).length;
-    if (attackerRows.length && defenderRows.length) {
-      if (defenderAlive === 0 && attackerAlive > 0) return { type: "win", winner: "attackers", source: "damage-summary" };
-      if (attackerAlive === 0 && defenderAlive > 0) return { type: "loss", winner: "defenders", source: "damage-summary" };
+    const aNames = new Set((attackers || []).map(x => normalize(x?.name || "")).filter(Boolean));
+    const dNames = new Set((defenders || []).map(x => normalize(x?.name || "")).filter(Boolean));
+    const header = document.querySelector("#reportHeader");
+    const headerText = normalize(header?.textContent || "");
+    const winnerMatch = headerText.match(/\bWinner:\s*(.+?)\s*$/i);
+    if (winnerMatch) {
+      const winner = normalize(winnerMatch[1]);
+      if (aNames.has(winner)) return { type: "win", winner, source: "report-header" };
+      if (dNames.has(winner)) return { type: "loss", winner, source: "report-header" };
+      if (/^(?:attackers?|player|you)$/i.test(winner)) return { type: "win", winner, source: "report-header" };
+      if (/^defenders?$/i.test(winner)) return { type: "loss", winner, source: "report-header" };
     }
-    const headings = [...document.querySelectorAll("h1, h2, h3, h4, legend, .section-header")];
-    for (const node of headings) {
-      const text = normalize(node.textContent || "");
-      const match = text.match(/^Winner:\s*(.+)$/i);
-      if (!match) continue;
-      const winner = normalize(match[1]);
-      if (aNames.has(winner)) return { type: "win", winner, source: "winner-heading" };
-      if (dNames.has(winner)) return { type: "loss", winner, source: "winner-heading" };
-      if (/attackers|attacker/i.test(winner)) return { type: "win", winner, source: "winner-heading" };
-      if (/defenders|defender/i.test(winner)) return { type: "loss", winner, source: "winner-heading" };
-    }
+    const headerClass = String(header?.className || "").trim();
+    // The report header's final-result class is authoritative for automation.
+    // Fighter/participant lists may still be partially hydrated, so do not
+    // require a parsed winner name before accepting a completed fight.
+    if (/\breportWin\b/i.test(headerClass)) return { type: "win", winner: aNames.size ? [...aNames][0] : null, source: "report-header-class" };
+    if (/\breportLose\b/i.test(headerClass)) return { type: "loss", winner: dNames.size ? [...dNames][0] : null, source: "report-header-class" };
     return { type: "unknown", winner: null, source: null };
   }
 
@@ -3485,22 +3501,30 @@ ${warnings}`
         return fighter;
       }).filter(Boolean);
       const reward = parseCombatReward();
-      const damageSummary = parseCombatDamageSummary();
+      const damageSummary = parseDungeonDamageSummary();
       const outcome = deriveCircusOutcome(attackers, defenders, damageSummary);
+      // A Circus fight is complete for Auto Combat as soon as Gladiatus exposes
+      // a definitive Win/Loss in the report header. The participant lists,
+      // combat events, reward block and damage summary can hydrate unevenly;
+      // they are useful enrichment, but must never block scheduler progress.
       const missingRequired = [];
+      const missingOptional = [];
       if (!reportId) missingRequired.push("reportId");
-      if (attackerContainers.length < 5) missingRequired.push(`attacker fighter containers (${attackerContainers.length}/5)`);
-      if (defenderContainers.length < 5) missingRequired.push(`defender fighter containers (${defenderContainers.length}/5)`);
-      if (attackers.length < 5) missingRequired.push(`attacker stats (${attackers.length}/5)`);
-      if (defenders.length < 5) missingRequired.push(`defender stats (${defenders.length}/5)`);
-      if (attackers.some(f => (f.rawRows?.length || 0) < 8)) missingRequired.push("complete attacker fighter stats");
-      if (defenders.some(f => (f.rawRows?.length || 0) < 8)) missingRequired.push("complete defender fighter stats");
-      if (!eventData?.rounds?.length || !eventData?.eventCount) missingRequired.push("combat events");
+      if (attackerContainers.length < 5) missingOptional.push(`attacker fighter containers (${attackerContainers.length}/5)`);
+      if (defenderContainers.length < 5) missingOptional.push(`defender fighter containers (${defenderContainers.length}/5)`);
+      if (attackers.length < 5) missingOptional.push(`attacker stats (${attackers.length}/5)`);
+      if (defenders.length < 5) missingOptional.push(`defender stats (${defenders.length}/5)`);
+      if (attackers.some(f => (f.rawRows?.length || 0) < 8)) missingOptional.push("complete attacker fighter stats");
+      if (defenders.some(f => (f.rawRows?.length || 0) < 8)) missingOptional.push("complete defender fighter stats");
+      if (!eventData?.rounds?.length || !eventData?.eventCount) missingOptional.push("combat events");
+      if (!reward) missingOptional.push("reward");
+      if (damageSummary.length < 10) missingOptional.push(`damage summary (${damageSummary.length}/10)`);
+      if (outcome.type === "unknown") missingRequired.push("final result");
       const readiness = {
         ready: missingRequired.length === 0,
-        complete: missingRequired.length === 0 && !!reward && damageSummary.length >= 10 && outcome.type !== "unknown",
+        complete: missingRequired.length === 0,
         missingRequired,
-        missingOptional: [!reward ? "reward" : null, damageSummary.length < 10 ? `damage summary (${damageSummary.length}/10)` : null, outcome.type === "unknown" ? "final result" : null].filter(Boolean),
+        missingOptional,
         reportId: String(reportId),
         format: "5v5",
         attackerFighters: attackers.length,
@@ -3510,8 +3534,8 @@ ${warnings}`
       };
       const existingIndex = circusCombatStore.reports.findIndex(report => String(report.reportId) === String(reportId));
       const existing = existingIndex >= 0 ? circusCombatStore.reports[existingIndex] : null;
-      if (!readiness.ready) return { captured: false, reason: "report-not-ready", readiness, report: existing || null };
-      if (existing?.captureDiagnostics?.readiness?.complete && readiness.complete) return { captured: false, reason: "already-captured", report: existing };
+      if (!readiness.complete) return { captured: false, reason: "report-not-ready", readiness, report: existing || null };
+      if (existing?.captureDiagnostics?.readiness?.complete) return { captured: false, reason: "already-captured", report: existing };
 
       const now = new Date().toISOString();
       const record = {
@@ -4399,13 +4423,9 @@ ${warnings}`
     return (hash >>> 0) || 1;
   }
 
-  async function analyzeCurrentArenaOpponents() {
-    if (arenaAnalysisBusy) return { ok: false, reason: "busy", error: "Arena analysis is already running." };
-    if (!isProvinciarumArenaPage()) return { ok: false, reason: "not-arena-page" };
-    const opponents = parseArenaOpponents();
-    if (!opponents.length) return { ok: false, reason: "no-opponents" };
-
+  async function performArenaOpponentAnalysis(opponents) {
     arenaAnalysisBusy = true;
+    renderNativeOpponentWinRateBadges();
     renderAutoCombatUI();
     try {
       await loadCharacterProfileStore();
@@ -4507,7 +4527,49 @@ ${warnings}`
       return { ok: false, reason: "analysis-error", error: error?.message || String(error) };
     } finally {
       arenaAnalysisBusy = false;
+      renderNativeOpponentWinRateBadges();
       renderAutoCombatUI();
+    }
+  }
+
+  function arenaAnalysisCacheIsCurrent(opponents) {
+    if (!Array.isArray(opponents) || !opponents.length) return false;
+    if (arenaOpponentAnalysisStore?.setSignature !== arenaAnalysisSetSignature(opponents)) return false;
+    const simulations = arenaSimulationCount();
+    return opponents.every(op => {
+      const result = arenaOpponentAnalysisStore?.opponents?.[op.key];
+      return result?.ok === true && Number(result.simulations) === simulations && Number.isFinite(Number(result.current?.winRate));
+    });
+  }
+
+  async function analyzeCurrentArenaOpponents() {
+    if (!isProvinciarumArenaPage()) return { ok: false, reason: "not-arena-page" };
+    const opponents = parseArenaOpponents();
+    if (!opponents.length) return { ok: false, reason: "no-opponents" };
+    if (arenaAnalysisPromise) return arenaAnalysisPromise;
+
+    arenaAnalysisPromise = (async () => {
+      await loadArenaOpponentAnalysisStore();
+      if (arenaAnalysisCacheIsCurrent(opponents)) {
+        renderNativeOpponentWinRateBadges();
+        return {
+          ok: true,
+          reused: true,
+          reason: "cached",
+          completed: opponents.length,
+          total: opponents.length,
+          failures: 0,
+          setSignature: arenaOpponentAnalysisStore.setSignature,
+          results: arenaOpponentAnalysisStore.opponents,
+          playerProfile: arenaOpponentAnalysisStore.playerProfile
+        };
+      }
+      return performArenaOpponentAnalysis(opponents);
+    })();
+    try {
+      return await arenaAnalysisPromise;
+    } finally {
+      arenaAnalysisPromise = null;
     }
   }
 
@@ -4616,7 +4678,16 @@ ${warnings}`
     try {
       const url = new URL(location.href);
       return url.searchParams.get("mod") === "arena"
-        && url.searchParams.get("submod") === "serverArena"
+        && ["serverArena", "getNewOpponents"].includes(url.searchParams.get("submod"))
+        && url.searchParams.get("aType") === "3";
+    } catch (_) { return false; }
+  }
+
+  function isCircusProvinciarumOpponentRefreshPage() {
+    try {
+      const url = new URL(location.href);
+      return url.searchParams.get("mod") === "arena"
+        && url.searchParams.get("submod") === "getNewOpponents"
         && url.searchParams.get("aType") === "3";
     } catch (_) { return false; }
   }
@@ -4824,24 +4895,9 @@ ${warnings}`
     return opponents.map(op => op.key).sort().join("||");
   }
 
-  async function analyzeCurrentCircusProvinciarumOpponents() {
-    if (circusProvinciarumAnalysisBusy) return { ok: false, reason: "busy", error: "Circus Provinciarum analysis is already running." };
-    if (!isCircusProvinciarumPage()) return { ok: false, reason: "not-provinciarum-page" };
-    const opponents = parseCircusProvinciarumOpponents();
-    if (opponents.length !== 5) {
-      const container = document.querySelector("#own3");
-      const rowCount = container ? container.querySelectorAll("table tbody tr").length : 0;
-      logAutoCombatDiagnostic("provinciarum-analysis-invalid-opponent-count", {
-        opponentCount: opponents.length,
-        containerFound: !!container,
-        containerId: container?.id || null,
-        rowCount,
-        expectedContainerId: "own3"
-      });
-      return { ok: false, reason: "invalid-opponent-count", error: `Circus Provinciarum must expose exactly 5 opponents; found ${opponents.length}.` };
-    }
-
+  async function performCircusProvinciarumOpponentAnalysis(opponents) {
     circusProvinciarumAnalysisBusy = true;
+    renderNativeOpponentWinRateBadges();
     renderAutoCombatUI();
     try {
       await loadCharacterProfileStore();
@@ -5012,7 +5068,60 @@ ${warnings}`
       return { ok: false, reason: "analysis-error", error: error?.message || String(error) };
     } finally {
       circusProvinciarumAnalysisBusy = false;
+      renderNativeOpponentWinRateBadges();
       renderAutoCombatUI();
+    }
+  }
+
+  function circusProvinciarumAnalysisCacheIsCurrent(opponents) {
+    if (!Array.isArray(opponents) || opponents.length !== 5) return false;
+    if (circusProvinciarumAnalysisStore?.setSignature !== circusProvinciarumAnalysisSetSignature(opponents)) return false;
+    const simulations = circusProvinciarumSimulationCount();
+    return opponents.every(op => {
+      const result = circusProvinciarumAnalysisStore?.opponents?.[op.key];
+      return result?.ok === true && Number(result.simulations) === simulations && Number.isFinite(Number(result.current?.winRate));
+    });
+  }
+
+  async function analyzeCurrentCircusProvinciarumOpponents() {
+    if (!isCircusProvinciarumPage()) return { ok: false, reason: "not-provinciarum-page" };
+    const opponents = parseCircusProvinciarumOpponents();
+    if (opponents.length !== 5) {
+      const container = document.querySelector("#own3");
+      const rowCount = container ? container.querySelectorAll("table tbody tr").length : 0;
+      logAutoCombatDiagnostic("provinciarum-analysis-invalid-opponent-count", {
+        opponentCount: opponents.length,
+        containerFound: !!container,
+        containerId: container?.id || null,
+        rowCount,
+        expectedContainerId: "own3"
+      });
+      return { ok: false, reason: "invalid-opponent-count", error: `Circus Provinciarum must expose exactly 5 opponents; found ${opponents.length}.` };
+    }
+    if (circusProvinciarumAnalysisPromise) return circusProvinciarumAnalysisPromise;
+
+    circusProvinciarumAnalysisPromise = (async () => {
+      await loadCircusProvinciarumAnalysisStore();
+      if (circusProvinciarumAnalysisCacheIsCurrent(opponents)) {
+        renderNativeOpponentWinRateBadges();
+        return {
+          ok: true,
+          reused: true,
+          reason: "cached",
+          completed: opponents.length,
+          total: opponents.length,
+          failures: 0,
+          setSignature: circusProvinciarumAnalysisStore.setSignature,
+          results: circusProvinciarumAnalysisStore.opponents,
+          playerProfile: circusProvinciarumAnalysisStore.playerProfile
+        };
+      }
+      return performCircusProvinciarumOpponentAnalysis(opponents);
+    })();
+    try {
+      return await circusProvinciarumAnalysisPromise;
+    } finally {
+      circusProvinciarumAnalysisPromise = null;
     }
   }
 
@@ -5034,6 +5143,9 @@ ${warnings}`
       const ad = Number(a.analysis.current.avgEnemyDamage || 0);
       const bd = Number(b.analysis.current.avgEnemyDamage || 0);
       if (ad !== bd) return ad - bd;
+      const ar = Number(a.analysis.current.avgRounds ?? Number.POSITIVE_INFINITY);
+      const br = Number(b.analysis.current.avgRounds ?? Number.POSITIVE_INFINITY);
+      if (ar !== br) return ar - br;
       return a.opponent.index - b.opponent.index;
     });
     return analyzed[0].opponent;
@@ -5067,6 +5179,45 @@ ${warnings}`
     return null;
   }
 
+  function findRegularCircusTurmaLink() {
+    const selectors = [
+      'a[href*="mod=arena"][href*="submod=grouparena"]',
+      '#mainnav a.awesome-tabs'
+    ];
+    for (const selector of selectors) {
+      for (const anchor of Array.from(document.querySelectorAll(selector))) {
+        if (!anchor?.href) continue;
+        try {
+          const url = new URL(anchor.href, location.href);
+          if (url.origin === location.origin
+            && url.searchParams.get("mod") === "arena"
+            && url.searchParams.get("submod") === "grouparena") return anchor;
+        } catch (_) {}
+      }
+    }
+    return null;
+  }
+
+  function isRegularCircusTurmaPage() {
+    try {
+      const url = new URL(location.href);
+      return url.searchParams.get("mod") === "arena"
+        && url.searchParams.get("submod") === "grouparena";
+    } catch (_) { return false; }
+  }
+
+  function fallbackRegularCircusTurmaHref() {
+    try {
+      const current = new URL(location.href);
+      const target = new URL("/game/index.php", location.origin);
+      target.searchParams.set("mod", "arena");
+      target.searchParams.set("submod", "grouparena");
+      const sh = current.searchParams.get("sh");
+      if (sh) target.searchParams.set("sh", sh);
+      return target.href;
+    } catch (_) { return null; }
+  }
+
   function circusProvinciarumOpponentIsAttempted(opponent) {
     return !!opponent && Object.prototype.hasOwnProperty.call(circusProvinciarumAutomationState?.attemptedOpponents || {}, opponent.key);
   }
@@ -5083,20 +5234,22 @@ ${warnings}`
     const runs = Number(state.completedRuns) || 0;
     const max = Number(state.maxRuns) || 0;
     const target = state.pendingTargetName || "target";
+    const stats = autoOpponentSearchStats(state);
+    const withStats = text => `${text} · ${stats}`;
     switch (state.phase) {
-      case "starting": return `Starting · ${runs}/${max}`;
-      case "navigating": return `Opening Circus Provinciarum · ${runs}/${max}`;
-      case "waiting-cooldown": return `Waiting for Circus cooldown · ${runs}/${max}`;
-      case "waiting-other": return `Waiting for dispatcher · ${runs}/${max}`;
-      case "queued": return `Ready check · ${moduleReadinessLabel("provinciarum")} · ${runs}/${max}`;
-      case "checking": return `Analyzing Provinciarum opponents · ${runs}/${max}`;
-      case "refreshing": return `Requesting a new opponent set · ${runs}/${max}`;
-      case "confirming": return `Confirming 5v5 attack · ${target} · ${runs}/${max}`;
-      case "attacking": return `Circus Provinciarum fight started · ${target} · ${runs}/${max}`;
-      case "humanizing": return `Preparing Circus action · ${target} · ${runs}/${max}`;
-      case "waiting-report": return `Waiting for Circus report · ${target} · ${runs}/${max}`;
-      case "error": return `Stopped: ${state.error || "unexpected state"}`;
-      default: return `Running · ${runs}/${max}`;
+      case "starting": return withStats(`Starting · ${runs}/${max}`);
+      case "navigating": return withStats(`Opening Circus Provinciarum · ${runs}/${max}`);
+      case "waiting-cooldown": return withStats(`Waiting for Circus cooldown · ${runs}/${max}`);
+      case "waiting-other": return withStats(`Waiting for dispatcher · ${runs}/${max}`);
+      case "queued": return withStats(`Ready check · ${moduleReadinessLabel("provinciarum")} · ${runs}/${max}`);
+      case "checking": return withStats(`Analyzing Provinciarum opponents · ${runs}/${max}`);
+      case "refreshing": return withStats(`Requesting a new opponent set · ${runs}/${max}`);
+      case "confirming": return withStats(`Confirming 5v5 attack · ${target} · ${runs}/${max}`);
+      case "attacking": return withStats(`Circus Provinciarum fight started · ${target} · ${runs}/${max}`);
+      case "humanizing": return withStats(`Preparing Circus action · ${target} · ${runs}/${max}`);
+      case "waiting-report": return withStats(`Waiting for Circus report · ${target} · ${runs}/${max}`);
+      case "error": return withStats(`Stopped: ${state.error || "unexpected state"}`);
+      default: return withStats(`Running · ${runs}/${max}`);
     }
   }
 
@@ -5109,6 +5262,9 @@ ${warnings}`
           enabled: !!stored.enabled,
           maxRuns: Math.max(1, Math.min(CIRCUS_PROVINCIARUM_MAX_RUNS, Number(stored.maxRuns) || 100)),
           completedRuns: Math.max(0, Number(stored.completedRuns) || 0),
+          opponentSearches: Math.max(0, Number(stored.opponentSearches) || 0),
+          bestObservedWinRate: Number.isFinite(Number(stored.bestObservedWinRate)) ? Number(stored.bestObservedWinRate) : null,
+          lastBattle: stored.lastBattle && typeof stored.lastBattle === "object" ? { ...stored.lastBattle } : null,
           attemptedOpponents: stored.attemptedOpponents && typeof stored.attemptedOpponents === "object" ? { ...stored.attemptedOpponents } : {},
           unavailableOpponents: stored.unavailableOpponents && typeof stored.unavailableOpponents === "object" ? { ...stored.unavailableOpponents } : {},
           pendingTargetKey: stored.pendingTargetKey ? String(stored.pendingTargetKey) : null,
@@ -5130,7 +5286,7 @@ ${warnings}`
       }
     } catch (_) {}
     circusProvinciarumAutomationState = {
-      enabled: false, maxRuns: 100, completedRuns: 0, attemptedOpponents: {}, unavailableOpponents: {},
+      enabled: false, maxRuns: 100, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {}, unavailableOpponents: {},
       pendingTargetKey: null, pendingTargetName: "", pendingReportId: null, lastProcessedReportId: null,
       reportWaitReportId: null, reportWaitStartedAt: null, reportWaitAttempts: 0,
       readiness: "unknown", readyAt: null, phase: "stopped", startedAt: null, error: null
@@ -5157,47 +5313,124 @@ ${warnings}`
       renderAutoCombatUI();
       return false;
     }
-    const link = findCircusProvinciarumLink();
-    if (!link) {
-      releaseAutomationNavigation("provinciarum");
-      circusProvinciarumAutomationState.phase = "error";
-      circusProvinciarumAutomationState.error = "A server-provided Circus Provinciarum navigation link is not present on this page.";
+
+    const finalLink = findCircusProvinciarumLink();
+    if (finalLink) {
+      stopCircusProvinciarumAutomationTimer();
+      circusProvinciarumAutomationState.phase = "navigating";
+      circusProvinciarumAutomationState.error = null;
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("provinciarum-navigation-link-missing", {});
+      logAutoCombatDiagnostic("provinciarum-navigation-click-start", {
+        step: "final",
+        href: finalLink.href || finalLink.getAttribute("href") || null
+      });
+      const clicked = await humanizedClick(finalLink, "provinciarum-navigation");
+      logAutoCombatDiagnostic("provinciarum-navigation-click-result", {
+        step: "final",
+        clicked,
+        href: finalLink.href || finalLink.getAttribute("href") || null
+      });
+      if (!clicked) {
+        releaseAutomationNavigation("provinciarum");
+        circusProvinciarumAutomationState.phase = "checking";
+        circusProvinciarumAutomationState.error = "Circus Provinciarum navigation control disappeared before the click could be performed; retrying.";
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(500, "provinciarum-navigation-click-failed");
+      }
       return false;
     }
-    stopCircusProvinciarumAutomationTimer();
-    circusProvinciarumAutomationState.phase = "navigating";
-    circusProvinciarumAutomationState.error = null;
-    await saveCircusProvinciarumAutomationState();
-    renderAutoCombatUI();
-    logAutoCombatDiagnostic("provinciarum-navigation-click-start", { href: link.href || link.getAttribute("href") || null });
-    const clicked = await humanizedClick(link, "provinciarum-navigation");
-    logAutoCombatDiagnostic("provinciarum-navigation-click-result", { clicked, href: link.href || link.getAttribute("href") || null });
-    if (!clicked) {
-      releaseAutomationNavigation("provinciarum");
-      circusProvinciarumAutomationState.phase = "checking";
-      circusProvinciarumAutomationState.error = "Circus Provinciarum navigation control disappeared before the click could be performed; retrying.";
+
+    if (isRegularCircusTurmaPage()) {
+      circusProvinciarumAutomationState.phase = "navigating";
+      circusProvinciarumAutomationState.error = "On regular Circus Turma; waiting for the Provinciarum Circus link.";
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
-      scheduleAutoCombatResume(500, "provinciarum-navigation-click-failed");
+      logAutoCombatDiagnostic("provinciarum-navigation-intermediate-ready", {
+        step: "regular-circus-turma",
+        destination: "Circus Provinciarum"
+      });
+      scheduleAutoCombatResume(350, "provinciarum-final-link-wait");
+      return false;
+    }
+
+    const intermediateLink = findRegularCircusTurmaLink();
+    const fallbackHref = fallbackRegularCircusTurmaHref();
+    const href = intermediateLink?.href || fallbackHref;
+    if (!href) {
+      releaseAutomationNavigation("provinciarum");
+      circusProvinciarumAutomationState.phase = "error";
+      circusProvinciarumAutomationState.error = "Could not reach regular Circus Turma to continue to Circus Provinciarum.";
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-navigation-link-missing", {
+        step: "intermediate",
+        target: "regular-circus-turma"
+      });
+      return false;
+    }
+
+    stopCircusProvinciarumAutomationTimer();
+    circusProvinciarumAutomationState.phase = "navigating";
+    circusProvinciarumAutomationState.error = "Provinciarum Circus is not directly reachable; opening regular Circus Turma first.";
+    await saveCircusProvinciarumAutomationState();
+    renderAutoCombatUI();
+    logAutoCombatDiagnostic("provinciarum-navigation-intermediate-start", {
+      step: "regular-circus-turma",
+      href
+    });
+    if (intermediateLink) {
+      const clicked = await humanizedClick(intermediateLink, "provinciarum-navigation-intermediate");
+      logAutoCombatDiagnostic("provinciarum-navigation-intermediate-result", { clicked, href });
+      if (!clicked) {
+        releaseAutomationNavigation("provinciarum");
+        circusProvinciarumAutomationState.phase = "checking";
+        circusProvinciarumAutomationState.error = "Regular Circus Turma navigation control disappeared before the click could be performed; retrying.";
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(500, "provinciarum-intermediate-click-failed");
+      }
+    } else {
+      logAutoCombatDiagnostic("provinciarum-navigation-intermediate-fallback", { step: "regular-circus-turma", href });
+      location.href = href;
     }
     return false;
   }
 
-  async function requestNewCircusProvinciarumOpponents() {
+  async function requestNewCircusProvinciarumOpponents(reason = null) {
     const form = document.querySelector('form[name="filterForm"][action*="getNewOpponents"][action*="aType=3"]');
     const submit = form?.querySelector('input[type="submit"][name="actionButton"]') || form?.querySelector("input[type=submit]");
     if (!form || !submit) return false;
+    const currentCooldownMs = circusProvinciarumCooldownMs();
+    if (Number.isFinite(currentCooldownMs) && currentCooldownMs > 0) {
+      circusProvinciarumAutomationState.phase = "waiting-cooldown";
+      circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(currentCooldownMs)}.`;
+      setModuleReadiness("provinciarum", currentCooldownMs);
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-opponent-refresh-blocked-cooldown", { cooldownMs: currentCooldownMs, reason: reason || null });
+      scheduleAutoCombatResume(Math.max(25, currentCooldownMs + 25), "provinciarum-refresh-cooldown");
+      return false;
+    }
     circusProvinciarumAutomationState.phase = "refreshing";
-    circusProvinciarumAutomationState.error = "All five visible Provinciarum opponents have already been attempted; requesting a fresh opponent set.";
+    circusProvinciarumAutomationState.error = reason || "All five visible Provinciarum opponents have already been attempted; requesting a fresh opponent set.";
     await saveCircusProvinciarumAutomationState();
     renderAutoCombatUI();
     stopCircusProvinciarumAutomationTimer();
+    const previousSearches = Math.max(0, Number(circusProvinciarumAutomationState.opponentSearches) || 0);
+    circusProvinciarumAutomationState.opponentSearches = previousSearches + 1;
+    await saveCircusProvinciarumAutomationState();
+    logAutoCombatDiagnostic("provinciarum-opponent-refresh-start", {
+      searchNumber: circusProvinciarumAutomationState.opponentSearches,
+      reason: reason || null
+    });
     const clicked = await humanizedClick(submit, "provinciarum-refresh-opponents");
-    if (clicked) scheduleAutoCombatResume(500, "provinciarum-opponent-refresh-settle");
+    if (clicked) {
+      scheduleAutoCombatResume(500, "provinciarum-opponent-refresh-settle");
+    }
     if (!clicked) {
+      circusProvinciarumAutomationState.opponentSearches = previousSearches;
       circusProvinciarumAutomationState.phase = "checking";
       circusProvinciarumAutomationState.error = "Circus Provinciarum Search control disappeared before the click could be performed; retrying.";
       await saveCircusProvinciarumAutomationState();
@@ -5239,7 +5472,7 @@ ${warnings}`
       const runsInput = shadow?.querySelector("#ga-auto-provinciarum-runs");
       const maxRuns = Math.max(1, Math.min(CIRCUS_PROVINCIARUM_MAX_RUNS, Number(runsInput?.value) || circusProvinciarumAutomationState.maxRuns || 100));
       circusProvinciarumAutomationState = {
-        enabled: true, maxRuns, completedRuns: 0, attemptedOpponents: {}, unavailableOpponents: {}, pendingTargetKey: null, pendingTargetName: "", pendingReportId: null, lastProcessedReportId: null,
+        enabled: true, maxRuns, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {}, unavailableOpponents: {}, pendingTargetKey: null, pendingTargetName: "", pendingReportId: null, lastProcessedReportId: null,
         reportWaitReportId: null, reportWaitStartedAt: null, reportWaitAttempts: 0,
         readiness: "unknown", readyAt: null, phase: "starting", startedAt: new Date().toISOString(), error: null
       };
@@ -5252,7 +5485,21 @@ ${warnings}`
     }
   }
 
-  async function markCircusProvinciarumRunComplete(reportId, { captureDeferred = false } = {}) {
+  function buildAutoCombatPostBattleDecision(module, reportId, completedRuns, maxRuns) {
+    const store = module === "arena" ? arenaCombatStore : circusCombatStore;
+    const report = store?.reports?.find(item => String(item?.reportId || "") === String(reportId || "")) || null;
+    const metrics = report ? combatRecordMetrics(report) : null;
+    const result = report ? combatOutcomeLabel(report.outcome) : "Unknown";
+    const willComplete = completedRuns >= maxRuns;
+    return {
+      module, reportId: reportId ? String(reportId) : null, result, opponent: report ? combatRecordOpponentLabel(report) : null,
+      damageTaken: metrics ? (metrics.enemyDamageSummary ?? metrics.enemyDamage) : null,
+      damageDealt: metrics ? (metrics.playerDamageSummary ?? metrics.playerDamage) : null,
+      nextAction: willComplete ? "complete-run" : "return-to-scheduler"
+    };
+  }
+
+  async function markCircusProvinciarumRunComplete(reportId) {
     if (!circusProvinciarumAutomationState?.enabled) return;
     const id = reportId ? String(reportId) : null;
     if (!id) return;
@@ -5270,16 +5517,11 @@ ${warnings}`
     circusProvinciarumAutomationState.reportWaitStartedAt = null;
     circusProvinciarumAutomationState.reportWaitAttempts = 0;
     circusProvinciarumAutomationState.completedRuns = Math.min(circusProvinciarumAutomationState.maxRuns, (Number(circusProvinciarumAutomationState.completedRuns) || 0) + 1);
+    const postBattleDecision = buildAutoCombatPostBattleDecision("provinciarum", id, circusProvinciarumAutomationState.completedRuns, circusProvinciarumAutomationState.maxRuns);
+    circusProvinciarumAutomationState.lastBattle = postBattleDecision;
+    logAutoCombatDiagnostic("provinciarum-post-battle-decision", postBattleDecision);
     circusProvinciarumAutomationState.pendingTargetKey = null;
     circusProvinciarumAutomationState.pendingTargetName = "";
-    if (captureDeferred) {
-      logAutoCombatDiagnostic("provinciarum-report-capture-deferred", {
-        reportId: id,
-        previousPendingReportId: previousPending,
-        reason: "report-loading-grace-exceeded",
-        completedRuns: circusProvinciarumAutomationState.completedRuns || 0
-      });
-    }
     if (circusProvinciarumAutomationState.completedRuns >= circusProvinciarumAutomationState.maxRuns) {
       releaseAutomationNavigation("provinciarum");
       stopCircusProvinciarumAutomationTimer();
@@ -5288,15 +5530,13 @@ ${warnings}`
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
       if (statusEl) statusEl.textContent = `Circus Provinciarum complete · ${circusProvinciarumAutomationState.completedRuns} fights.`;
-      logAutoCombatDiagnostic("provinciarum-complete", { reason: captureDeferred ? "max-runs-after-report-recovery" : "max-runs", completedRuns: circusProvinciarumAutomationState.completedRuns, remainingModules: autoCombatEnabledModules() });
+      logAutoCombatDiagnostic("provinciarum-complete", { reason: "max-runs", completedRuns: circusProvinciarumAutomationState.completedRuns, remainingModules: autoCombatEnabledModules() });
       if (autoCombatEnabledModules().length) scheduleAutoCombatResume(0, "provinciarum-max-runs-handoff");
       else { stopAutoCombatDispatcherTimer(); stopAutoCombatCooldownObserver(); }
       return;
     }
     circusProvinciarumAutomationState.phase = "queued";
-    circusProvinciarumAutomationState.error = captureDeferred
-      ? "Circus report did not fully load before the recovery limit; the fight was counted and the dispatcher was released."
-      : null;
+    circusProvinciarumAutomationState.error = null;
     await saveCircusProvinciarumAutomationState();
     renderAutoCombatUI();
     await completeAutoCombatModule("provinciarum");
@@ -5470,10 +5710,37 @@ ${warnings}`
             elapsedMs,
             graceMs: CIRCUS_REPORT_LOADING_GRACE_MS,
             attempts: circusProvinciarumAutomationState.reportWaitAttempts || 0,
-            reason: "report-never-reached-required-5v5-structure",
-            missingRequired: result?.readiness?.missingRequired || []
+            reason: "report-never-reached-complete-5v5-structure",
+            missingRequired: result?.readiness?.missingRequired || [],
+            missingOptional: result?.readiness?.missingOptional || []
           });
-          await markCircusProvinciarumRunComplete(reportId, { captureDeferred: true });
+
+          // An incomplete Circus report is a failed/abandoned automation action,
+          // not a reason to disable the entire scheduler. Mark this report as
+          // handled so the same report cannot trap the module in waiting-report,
+          // clear the pending action/navigation ownership, and return control to
+          // the shared dispatcher. The fight is deliberately NOT counted.
+          circusProvinciarumAutomationState.lastProcessedReportId = String(reportId);
+          circusProvinciarumAutomationState.pendingReportId = null;
+          circusProvinciarumAutomationState.reportWaitReportId = null;
+          circusProvinciarumAutomationState.reportWaitStartedAt = null;
+          circusProvinciarumAutomationState.reportWaitAttempts = 0;
+          circusProvinciarumAutomationState.pendingTargetKey = null;
+          circusProvinciarumAutomationState.pendingTargetName = "";
+          circusProvinciarumAutomationState.phase = "queued";
+          circusProvinciarumAutomationState.error = `Circus combat report did not become complete within the ${Math.round(CIRCUS_REPORT_LOADING_GRACE_MS / 1000)}-second recovery window; the fight was not counted. Returning to the routine.`;
+          releaseAutomationNavigation("provinciarum");
+          stopCircusProvinciarumAutomationTimer();
+          await saveCircusProvinciarumAutomationState();
+          renderAutoCombatUI();
+          logAutoCombatDiagnostic("provinciarum-report-recovery-handoff", {
+            reportId: String(reportId),
+            completedRuns: circusProvinciarumAutomationState.completedRuns || 0,
+            phase: circusProvinciarumAutomationState.phase,
+            nextAction: "resume-shared-dispatcher",
+            fightCounted: false
+          });
+          scheduleAutoCombatResume(0, "provinciarum-report-recovery-handoff");
           return;
         }
         await saveCircusProvinciarumAutomationState();
@@ -5500,6 +5767,50 @@ ${warnings}`
       return;
     }
 
+    const provinciarumRefreshPage = isCircusProvinciarumOpponentRefreshPage() && circusProvinciarumAutomationState.phase === "refreshing";
+    if (provinciarumRefreshPage) {
+      const refreshCooldownMs = circusProvinciarumCooldownMs();
+      logAutoCombatDiagnostic("provinciarum-opponent-refresh-cooldown-check", {
+        cooldownMs: refreshCooldownMs,
+        url: location.href
+      });
+      if (!Number.isFinite(refreshCooldownMs)) {
+        circusProvinciarumAutomationState.error = "Waiting for the Circus Provinciarum cooldown to appear after requesting new opponents.";
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(350, "provinciarum-opponent-refresh-wait-cooldown");
+        return;
+      }
+      if (refreshCooldownMs > 0) {
+        circusProvinciarumAutomationState.phase = "waiting-cooldown";
+        circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(refreshCooldownMs)}.`;
+        setModuleReadiness("provinciarum", refreshCooldownMs);
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("provinciarum-opponent-refresh-cooldown-detected", { cooldownMs: refreshCooldownMs });
+        scheduleAutoCombatResume(Math.max(25, refreshCooldownMs + 25), "provinciarum-refresh-cooldown");
+        return;
+      }
+      const refreshedOpponents = parseCircusProvinciarumOpponents();
+      logAutoCombatDiagnostic("provinciarum-opponent-refresh-page-ready", {
+        opponentCount: refreshedOpponents.length,
+        url: location.href
+      });
+      if (!refreshedOpponents.length) {
+        circusProvinciarumAutomationState.error = "Waiting for the refreshed Circus Provinciarum opponent list to finish loading.";
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(350, "provinciarum-opponent-refresh-wait-list");
+        return;
+      }
+      circusProvinciarumAutomationState.phase = "checking";
+      circusProvinciarumAutomationState.error = null;
+      setModuleReadiness("provinciarum", 0);
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-opponent-refresh-page-accepted", { opponentCount: refreshedOpponents.length });
+    }
+
     const provinciarumContainer = document.querySelector("#own3");
     const provinciarumRows = provinciarumContainer ? provinciarumContainer.querySelectorAll("table tbody tr").length : 0;
     const parsedProvinciarumOpponents = parseCircusProvinciarumOpponents();
@@ -5513,6 +5824,7 @@ ${warnings}`
     });
     const analysis = await analyzeCurrentCircusProvinciarumOpponents();
     logAutoCombatDiagnostic("provinciarum-opponent-analysis", { ok: analysis?.ok, completed: analysis?.completed, total: analysis?.total, failures: analysis?.failures });
+    await recordOpponentAnalysisSnapshot("provinciarum", parseCircusProvinciarumOpponents(), circusProvinciarumAnalysisStore);
     if (!analysis?.ok) {
       const refreshed = await requestNewCircusProvinciarumOpponents();
       if (refreshed) {
@@ -5534,9 +5846,37 @@ ${warnings}`
       return;
     }
 
+    const circusLowWinRateSafeguard = lowWinRateOpponentSetSafeguard(
+      "provinciarum",
+      parsedProvinciarumOpponents,
+      circusProvinciarumAnalysisStore,
+      circusProvinciarumOpponentIsAttempted
+    );
+    logAutoCombatDiagnostic("provinciarum-win-rate-safeguard-check", circusLowWinRateSafeguard);
+    if (circusLowWinRateSafeguard.triggered) {
+      const threshold = circusLowWinRateSafeguard.threshold;
+      const refreshed = await requestNewCircusProvinciarumOpponents(
+        `All ${circusLowWinRateSafeguard.candidates.length} unattempted Circus Provinciarum opponents are below the ${threshold}% minimum win-rate threshold; requesting a fresh opponent set.`
+      );
+      if (refreshed) {
+        logAutoCombatDiagnostic("provinciarum-win-rate-safeguard-triggered", circusLowWinRateSafeguard);
+        return;
+      }
+      circusProvinciarumAutomationState.enabled = false;
+      circusProvinciarumAutomationState.phase = "error";
+      circusProvinciarumAutomationState.pendingTargetKey = null;
+      circusProvinciarumAutomationState.pendingTargetName = "";
+      circusProvinciarumAutomationState.error = "The minimum Circus opponent win-rate safeguard triggered, but the Search for opponents control could not be clicked.";
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-win-rate-safeguard-search-failed", circusLowWinRateSafeguard);
+      return;
+    }
+
     const target = chooseCircusProvinciarumTarget();
     logAutoCombatDiagnostic("provinciarum-target-selection", {
       selected: target ? { key: target.key, name: target.name, level: target.level, province: target.province, playerId: target.playerId, winRate: circusProvinciarumAnalysisStore?.opponents?.[target.key]?.current?.winRate ?? null } : null,
+      selectionPolicy: "highest win rate, then lowest expected team damage taken, then shortest expected fight",
       visibleOpponents: parseCircusProvinciarumOpponents().map(opponent => ({ key: opponent.key, name: opponent.name, level: opponent.level, province: opponent.province, playerId: opponent.playerId, attempted: circusProvinciarumOpponentIsAttempted(opponent), winRate: circusProvinciarumAnalysisStore?.opponents?.[opponent.key]?.current?.winRate ?? null }))
     });
     if (!target) {
@@ -5616,7 +5956,16 @@ ${warnings}`
     try {
       const url = new URL(location.href);
       return url.searchParams.get("mod") === "arena"
-        && url.searchParams.get("submod") === "serverArena"
+        && ["serverArena", "getNewOpponents"].includes(url.searchParams.get("submod"))
+        && url.searchParams.get("aType") === "2";
+    } catch (_) { return false; }
+  }
+
+  function isArenaOpponentRefreshPage() {
+    try {
+      const url = new URL(location.href);
+      return url.searchParams.get("mod") === "arena"
+        && url.searchParams.get("submod") === "getNewOpponents"
         && url.searchParams.get("aType") === "2";
     } catch (_) { return false; }
   }
@@ -5648,6 +5997,198 @@ ${warnings}`
     }).filter(Boolean);
   }
 
+  function nativeOpponentWinRateLightState(winRate) {
+    const n = Number(winRate);
+    if (!Number.isFinite(n)) return "error";
+    const threshold = minimumOpponentWinRateThresholdPercent();
+    if (threshold > 0) {
+      if (n >= threshold) return "good";
+      if (n >= Math.max(0, threshold - 5)) return "warn";
+      return "bad";
+    }
+    // With the minimum-win-rate safeguard disabled, use the simulation itself
+    // as the traffic-light signal: >=65% green, 50–64.9% yellow, <50% red.
+    if (n >= 65) return "good";
+    if (n >= 50) return "warn";
+    return "bad";
+  }
+
+  function nativeOpponentWinRateLabel(result, busy, mode) {
+    if (busy) {
+      return {
+        text: "Analyzing…",
+        state: "pending",
+        light: "warn",
+        title: `${mode === "circus" ? "Circus team" : "Arena opponent"} analysis is running with ${globalSimulationCount()} simulations.`
+      };
+    }
+    if (!result) return null;
+    if (result.ok) {
+      const winRate = Number(result.current?.winRate);
+      if (!Number.isFinite(winRate)) {
+        return { text: "Win rate unavailable", state: "error", light: "error", title: "The analysis result did not contain a valid win-rate value." };
+      }
+      const simulations = Number(result.simulations);
+      const configured = globalSimulationCount();
+      if (Number.isFinite(simulations) && simulations !== configured) {
+        return {
+          text: "Reanalyze",
+          state: "stale",
+          light: "warn",
+          title: `This result used ${simulations} simulations, while the current global setting is ${configured}. Click Analyze Now to refresh this result.`
+        };
+      }
+      return {
+        text: `Winrate: ${winRate.toFixed(1)}%`,
+        state: "ready",
+        light: nativeOpponentWinRateLightState(winRate),
+        title: `${mode === "circus" ? "5v5 team" : "Arena opponent"} simulation: ${winRate.toFixed(1)}% win rate using ${Number.isFinite(simulations) ? simulations : configured} simulations.`
+      };
+    }
+    return {
+      text: "Analysis unavailable",
+      state: "error",
+      light: "error",
+      title: result.error || "The opponent analysis did not complete successfully."
+    };
+  }
+
+  function positionNativeOpponentWinRateBadge(badge, attackButton, actionCell) {
+    if (!badge || !attackButton || !actionCell) return;
+    const cellRect = actionCell.getBoundingClientRect();
+    const attackRect = attackButton.getBoundingClientRect();
+    if (!cellRect.width && !cellRect.height) return;
+    const left = Math.max(0, attackRect.right - cellRect.left + 7);
+    const centerY = attackRect.top - cellRect.top + attackRect.height / 2;
+    badge.style.left = `${left}px`;
+    badge.style.top = `${centerY}px`;
+  }
+
+  function clearNativeOpponentWinRateHost(actionCell) {
+    if (!actionCell) return;
+    actionCell.classList.remove("ga-native-winrate-host");
+  }
+
+  function renderNativeOpponentWinRateBadges() {
+    const arenaPage = isProvinciarumArenaPage();
+    const circusPage = isCircusProvinciarumPage();
+    if (!arenaPage && !circusPage) {
+      document.querySelectorAll(".ga-native-winrate-badge").forEach(el => el.remove());
+      document.querySelectorAll(".ga-native-winrate-host").forEach(el => clearNativeOpponentWinRateHost(el));
+      return;
+    }
+
+    const mode = circusPage ? "circus" : "arena";
+    const container = circusPage ? document.querySelector("#own3") : document.querySelector("#own2");
+    if (!container) return;
+    const opponents = circusPage ? parseCircusProvinciarumOpponents() : parseArenaOpponents();
+    const store = circusPage ? circusProvinciarumAnalysisStore : arenaOpponentAnalysisStore;
+    const busy = circusPage ? circusProvinciarumAnalysisBusy : arenaAnalysisBusy;
+    const activeRows = new Set(opponents.map(op => op.row));
+
+    document.querySelectorAll(".ga-native-winrate-badge").forEach(el => {
+      const row = el.closest("tr");
+      if (!row || !activeRows.has(row)) {
+        const host = el.closest("td");
+        el.remove();
+        clearNativeOpponentWinRateHost(host);
+      }
+    });
+
+    for (const opponent of opponents) {
+      const row = opponent.row;
+      const profile = row?.querySelector('a[href*="mod=player"]');
+      const attackButton = opponent.button || row?.querySelector(".attack");
+      const actionCell = attackButton?.closest("td") || attackButton?.parentElement;
+      if (!row || !profile || !attackButton || !actionCell) continue;
+      const result = store?.opponents?.[opponent.key] || null;
+      const state = nativeOpponentWinRateLabel(result, busy, mode);
+      if (!state) {
+        const existing = row.querySelector(".ga-native-winrate-badge");
+        const host = existing?.closest("td");
+        existing?.remove();
+        clearNativeOpponentWinRateHost(host);
+        continue;
+      }
+
+      let badge = row.querySelector(".ga-native-winrate-badge");
+      if (!badge) {
+        badge = document.createElement("span");
+        badge.className = "ga-native-winrate-badge";
+        badge.dataset.gaMode = mode;
+        const dot = document.createElement("span");
+        dot.className = "ga-native-winrate-dot";
+        dot.setAttribute("aria-hidden", "true");
+        const label = document.createElement("span");
+        label.className = "ga-native-winrate-text";
+        badge.append(dot, label);
+        actionCell.appendChild(badge);
+      }
+
+      actionCell.classList.add("ga-native-winrate-host");
+      badge.dataset.state = state.state;
+      badge.dataset.light = state.light;
+      badge.title = state.title;
+      const dot = badge.querySelector(".ga-native-winrate-dot");
+      const label = badge.querySelector(".ga-native-winrate-text");
+      if (dot) dot.dataset.light = state.light;
+      if (label && label.textContent !== state.text) label.textContent = state.text;
+      positionNativeOpponentWinRateBadge(badge, attackButton, actionCell);
+    }
+  }
+
+  function scheduleNativeOpponentWinRateRender() {
+    if (nativeOpponentWinRateRenderTimer) return;
+    nativeOpponentWinRateRenderTimer = setTimeout(() => {
+      nativeOpponentWinRateRenderTimer = null;
+      renderNativeOpponentWinRateBadges();
+    }, 0);
+  }
+
+  function scheduleNativeOpponentWinRateAutoAnalysis() {
+    if (!nativeOpponentWinRateAutoAnalysisReady) return;
+    if (!isProvinciarumArenaPage() && !isCircusProvinciarumPage()) return;
+    if (nativeOpponentWinRateAutoAnalysisTimer) return;
+    nativeOpponentWinRateAutoAnalysisTimer = setTimeout(() => {
+      nativeOpponentWinRateAutoAnalysisTimer = null;
+      void (async () => {
+        try {
+          if (isProvinciarumArenaPage()) {
+            const opponents = parseArenaOpponents();
+            if (opponents.length !== 5) return;
+            const result = await analyzeCurrentArenaOpponents();
+            logAutoCombatDiagnostic(result?.reused ? "native-arena-winrate-cache-reused" : "native-arena-winrate-auto-analysis-complete", { ok: !!result?.ok, reused: !!result?.reused, completed: result?.completed || 0, total: result?.total || 0, simulations: arenaSimulationCount(), setSignature: result?.setSignature || null });
+          } else if (isCircusProvinciarumPage()) {
+            const opponents = parseCircusProvinciarumOpponents();
+            if (opponents.length !== 5) return;
+            const result = await analyzeCurrentCircusProvinciarumOpponents();
+            logAutoCombatDiagnostic(result?.reused ? "native-provinciarum-winrate-cache-reused" : "native-provinciarum-winrate-auto-analysis-complete", { ok: !!result?.ok, reused: !!result?.reused, completed: result?.completed || 0, total: result?.total || 0, simulations: circusProvinciarumSimulationCount(), setSignature: result?.setSignature || null });
+          }
+        } catch (error) {
+          logAutoCombatDiagnostic("native-winrate-auto-analysis-error", { mode: isCircusProvinciarumPage() ? "circus" : "arena", error: error?.message || String(error), stack: error?.stack || null });
+        }
+      })();
+    }, 50);
+  }
+
+  function initializeNativeOpponentWinRateDisplay() {
+    if (typeof MutationObserver === "undefined" || !document.body) {
+      renderNativeOpponentWinRateBadges();
+      return;
+    }
+    if (!nativeOpponentWinRateObserver) {
+      nativeOpponentWinRateObserver = new MutationObserver((records) => {
+        const relevant = records.some(record => record.type === "childList");
+        if (!relevant) return;
+        if (!isProvinciarumArenaPage() && !isCircusProvinciarumPage()) return;
+        scheduleNativeOpponentWinRateRender();
+        scheduleNativeOpponentWinRateAutoAnalysis();
+      });
+      nativeOpponentWinRateObserver.observe(document.body, { childList: true, subtree: true });
+    }
+    scheduleNativeOpponentWinRateRender();
+  }
+
   function arenaAutomationStatusText() {
     const state = arenaAutomationState;
     if (!state?.enabled) {
@@ -5657,20 +6198,22 @@ ${warnings}`
     const runs = Number(state.completedRuns) || 0;
     const max = Number(state.maxRuns) || 0;
     const target = state.pendingTargetName || "target";
+    const stats = autoOpponentSearchStats(state);
+    const withStats = text => `${text} · ${stats}`;
     switch (state.phase) {
-      case "starting": return `Starting · ${runs}/${max}`;
-      case "navigating": return `Opening Provinciarum Arena · ${runs}/${max}`;
-      case "waiting-cooldown": return `Waiting for Arena cooldown · ${runs}/${max}`;
-      case "waiting-other": return `Waiting for dispatcher · ${runs}/${max}`;
-      case "queued": return `Ready check · ${moduleReadinessLabel("arena")} · ${runs}/${max}`;
-      case "checking": return `Analyzing Arena opponents · ${runs}/${max}`;
-      case "refreshing": return `Requesting a new opponent set · ${runs}/${max}`;
-      case "confirming": return `Confirming attack · ${target} · ${runs}/${max}`;
-      case "attacking": return `Arena fight started · ${target} · ${runs}/${max}`;
-      case "humanizing": return `Preparing Arena action · ${target} · ${runs}/${max}`;
-      case "waiting-report": return `Waiting for Arena report · ${target} · ${runs}/${max}`;
-      case "error": return `Stopped: ${state.error || "unexpected state"}`;
-      default: return `Running · ${runs}/${max}`;
+      case "starting": return withStats(`Starting · ${runs}/${max}`);
+      case "navigating": return withStats(`Opening Provinciarum Arena · ${runs}/${max}`);
+      case "waiting-cooldown": return withStats(`Waiting for Arena cooldown · ${runs}/${max}`);
+      case "waiting-other": return withStats(`Waiting for dispatcher · ${runs}/${max}`);
+      case "queued": return withStats(`Ready check · ${moduleReadinessLabel("arena")} · ${runs}/${max}`);
+      case "checking": return withStats(`Analyzing Arena opponents · ${runs}/${max}`);
+      case "refreshing": return withStats(`Requesting a new opponent set · ${runs}/${max}`);
+      case "confirming": return withStats(`Confirming attack · ${target} · ${runs}/${max}`);
+      case "attacking": return withStats(`Arena fight started · ${target} · ${runs}/${max}`);
+      case "humanizing": return withStats(`Preparing Arena action · ${target} · ${runs}/${max}`);
+      case "waiting-report": return withStats(`Waiting for Arena report · ${target} · ${runs}/${max}`);
+      case "error": return withStats(`Stopped: ${state.error || "unexpected state"}`);
+      default: return withStats(`Running · ${runs}/${max}`);
     }
   }
 
@@ -5683,6 +6226,9 @@ ${warnings}`
           enabled: !!stored.enabled,
           maxRuns: Math.max(1, Math.min(ARENA_MAX_RUNS, Number(stored.maxRuns) || 100)),
           completedRuns: Math.max(0, Number(stored.completedRuns) || 0),
+          opponentSearches: Math.max(0, Number(stored.opponentSearches) || 0),
+          bestObservedWinRate: Number.isFinite(Number(stored.bestObservedWinRate)) ? Number(stored.bestObservedWinRate) : null,
+          lastBattle: stored.lastBattle && typeof stored.lastBattle === "object" ? { ...stored.lastBattle } : null,
           attemptedOpponents: stored.attemptedOpponents && typeof stored.attemptedOpponents === "object" ? { ...stored.attemptedOpponents } : {},
           pendingTargetKey: stored.pendingTargetKey ? String(stored.pendingTargetKey) : null,
           pendingTargetName: normalize(stored.pendingTargetName || ""),
@@ -5697,7 +6243,7 @@ ${warnings}`
       }
     } catch (_) {}
     arenaAutomationState = {
-      enabled: false, maxRuns: 100, completedRuns: 0, attemptedOpponents: {},
+      enabled: false, maxRuns: 100, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {},
       pendingTargetKey: null, pendingTargetName: "", pendingReportId: null,
       readiness: "unknown", readyAt: null,
       phase: "stopped", startedAt: null, error: null
@@ -5752,18 +6298,103 @@ ${warnings}`
       '#cooldown_bar_arena .cooldown_bar_link'
     ];
     for (const selector of selectors) {
-      const anchor = document.querySelector(selector);
-      if (!anchor?.href) continue;
-      try {
-        const url = new URL(anchor.href, location.href);
-        if (url.origin === location.origin && url.searchParams.get("mod") === "arena" && url.searchParams.get("submod") === "serverArena" && url.searchParams.get("aType") === "2") return anchor;
-      } catch (_) {}
+      for (const anchor of Array.from(document.querySelectorAll(selector))) {
+        if (!anchor?.href) continue;
+        try {
+          const url = new URL(anchor.href, location.href);
+          if (url.origin === location.origin && url.searchParams.get("mod") === "arena" && url.searchParams.get("submod") === "serverArena" && url.searchParams.get("aType") === "2") return anchor;
+        } catch (_) {}
+      }
     }
     return null;
   }
 
+  function findRegularArenaLink() {
+    const selectors = [
+      'a[href*="mod=arena"]',
+      '#mainnav a.awesome-tabs'
+    ];
+    for (const selector of selectors) {
+      for (const anchor of Array.from(document.querySelectorAll(selector))) {
+        if (!anchor?.href) continue;
+        try {
+          const url = new URL(anchor.href, location.href);
+          if (url.origin === location.origin
+            && url.searchParams.get("mod") === "arena"
+            && !url.searchParams.get("submod")
+            && !url.searchParams.get("aType")) return anchor;
+        } catch (_) {}
+      }
+    }
+    return null;
+  }
+
+  function isRegularArenaPage() {
+    try {
+      const url = new URL(location.href);
+      return url.searchParams.get("mod") === "arena"
+        && !url.searchParams.get("submod")
+        && !url.searchParams.get("aType");
+    } catch (_) { return false; }
+  }
+
+  function fallbackRegularArenaHref() {
+    try {
+      const current = new URL(location.href);
+      const target = new URL("/game/index.php", location.origin);
+      target.searchParams.set("mod", "arena");
+      const sh = current.searchParams.get("sh");
+      if (sh) target.searchParams.set("sh", sh);
+      return target.href;
+    } catch (_) { return null; }
+  }
+
   function arenaOpponentIsAttempted(opponent) {
     return !!opponent && Object.prototype.hasOwnProperty.call(arenaAutomationState?.attemptedOpponents || {}, opponent.key);
+  }
+
+  function autoOpponentSearchStats(state) {
+    const searches = Math.max(0, Number(state?.opponentSearches) || 0);
+    const best = Number.isFinite(Number(state?.bestObservedWinRate)) ? Number(state.bestObservedWinRate) : null;
+    return `Searches ${searches} · Best ${best == null ? "—" : `${best.toFixed(1)}%`}`;
+  }
+
+  async function recordOpponentAnalysisSnapshot(module, opponents, analysisStore) {
+    const state = module === "arena" ? arenaAutomationState : circusProvinciarumAutomationState;
+    if (!state) return;
+    const attempted = module === "arena" ? arenaOpponentIsAttempted : circusProvinciarumOpponentIsAttempted;
+    const rates = (Array.isArray(opponents) ? opponents : [])
+      .filter(opponent => !attempted(opponent))
+      .map(opponent => Number(analysisStore?.opponents?.[opponent.key]?.current?.winRate))
+      .filter(Number.isFinite);
+    if (!rates.length) return;
+    const best = Math.max(...rates);
+    state.bestObservedWinRate = Number.isFinite(Number(state.bestObservedWinRate)) ? Math.max(Number(state.bestObservedWinRate), best) : best;
+    await (module === "arena" ? saveArenaAutomationState() : saveCircusProvinciarumAutomationState());
+  }
+
+  function lowWinRateOpponentSetSafeguard(module, opponents, analysisStore, attemptedPredicate) {
+    const threshold = minimumOpponentWinRateThresholdPercent();
+    if (threshold <= 0) return { triggered: false, disabled: true, threshold, candidates: [], winRates: [], missing: [] };
+    const candidates = (Array.isArray(opponents) ? opponents : [])
+      .filter(opponent => !attemptedPredicate || !attemptedPredicate(opponent));
+    const rows = candidates.map(opponent => ({
+      opponent,
+      analysis: analysisStore?.opponents?.[opponent.key] || null
+    }));
+    const missing = rows.filter(row => !row.analysis?.ok || !Number.isFinite(Number(row.analysis?.current?.winRate)));
+    const winRates = rows
+      .filter(row => row.analysis?.ok && Number.isFinite(Number(row.analysis?.current?.winRate)))
+      .map(row => Number(row.analysis.current.winRate));
+    const triggered = candidates.length > 0 && missing.length === 0 && winRates.every(rate => rate < threshold);
+    return {
+      triggered,
+      disabled: false,
+      threshold,
+      candidates: candidates.map(opponent => ({ key: opponent.key, name: opponent.name, index: opponent.index })),
+      winRates,
+      missing: missing.map(row => ({ key: row.opponent.key, name: row.opponent.name, reason: row.analysis?.error || "win rate unavailable" }))
+    };
   }
 
   function chooseArenaTarget() {
@@ -5779,6 +6410,9 @@ ${warnings}`
         const ad = Number(a.analysis?.current?.avgEnemyDamage ?? a.analysis?.current?.avgPlayerDamage ?? 0);
         const bd = Number(b.analysis?.current?.avgEnemyDamage ?? b.analysis?.current?.avgPlayerDamage ?? 0);
         if (ad !== bd) return ad - bd;
+        const ar = Number(a.analysis?.current?.avgRounds ?? Number.POSITIVE_INFINITY);
+        const br = Number(b.analysis?.current?.avgRounds ?? Number.POSITIVE_INFINITY);
+        if (ar !== br) return ar - br;
         return a.opponent.index - b.opponent.index;
       });
       return analyzed[0].opponent;
@@ -5806,47 +6440,124 @@ ${warnings}`
       renderAutoCombatUI();
       return false;
     }
-    const link = findProvinciarumArenaLink();
-    if (!link) {
-      logAutoCombatDiagnostic("arena-navigation-link-missing", {});
-      releaseAutomationNavigation("arena");
-      arenaAutomationState.phase = "error";
-      arenaAutomationState.error = "A server-provided Provinciarum Arena navigation link is not present on this page.";
+
+    const finalLink = findProvinciarumArenaLink();
+    if (finalLink) {
+      stopArenaAutomationTimer();
+      arenaAutomationState.phase = "navigating";
+      arenaAutomationState.error = null;
       await saveArenaAutomationState();
       renderAutoCombatUI();
+      logAutoCombatDiagnostic("arena-navigation-click-start", {
+        step: "final",
+        href: finalLink.href || finalLink.getAttribute("href") || null
+      });
+      const clicked = await humanizedClick(finalLink, "arena-navigation");
+      logAutoCombatDiagnostic("arena-navigation-click-result", {
+        step: "final",
+        clicked,
+        href: finalLink.href || finalLink.getAttribute("href") || null
+      });
+      if (!clicked) {
+        releaseAutomationNavigation("arena");
+        arenaAutomationState.phase = "checking";
+        arenaAutomationState.error = "Arena navigation control disappeared before the click could be performed; retrying.";
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(500, "arena-navigation-click-failed");
+      }
       return false;
     }
-    stopArenaAutomationTimer();
-    arenaAutomationState.phase = "navigating";
-    arenaAutomationState.error = null;
-    await saveArenaAutomationState();
-    renderAutoCombatUI();
-    logAutoCombatDiagnostic("arena-navigation-click-start", { href: link.href || link.getAttribute("href") || null });
-    const clicked = await humanizedClick(link, "arena-navigation");
-    logAutoCombatDiagnostic("arena-navigation-click-result", { clicked, href: link.href || link.getAttribute("href") || null });
-    if (!clicked) {
-      releaseAutomationNavigation("arena");
-      arenaAutomationState.phase = "checking";
-      arenaAutomationState.error = "Arena navigation control disappeared before the click could be performed; retrying.";
+
+    if (isRegularArenaPage()) {
+      arenaAutomationState.phase = "navigating";
+      arenaAutomationState.error = "On regular Arena; waiting for the Provinciarum Arena link.";
       await saveArenaAutomationState();
       renderAutoCombatUI();
-      scheduleAutoCombatResume(500);
+      logAutoCombatDiagnostic("arena-navigation-intermediate-ready", {
+        step: "regular-arena",
+        destination: "Provinciarum Arena"
+      });
+      scheduleAutoCombatResume(350, "arena-final-link-wait");
+      return false;
+    }
+
+    const intermediateLink = findRegularArenaLink();
+    const fallbackHref = fallbackRegularArenaHref();
+    const href = intermediateLink?.href || fallbackHref;
+    if (!href) {
+      releaseAutomationNavigation("arena");
+      arenaAutomationState.phase = "error";
+      arenaAutomationState.error = "Could not reach regular Arena to continue to Provinciarum Arena.";
+      await saveArenaAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("arena-navigation-link-missing", {
+        step: "intermediate",
+        target: "regular-arena"
+      });
+      return false;
+    }
+
+    stopArenaAutomationTimer();
+    arenaAutomationState.phase = "navigating";
+    arenaAutomationState.error = "Provinciarum Arena is not directly reachable; opening regular Arena first.";
+    await saveArenaAutomationState();
+    renderAutoCombatUI();
+    logAutoCombatDiagnostic("arena-navigation-intermediate-start", {
+      step: "regular-arena",
+      href
+    });
+    if (intermediateLink) {
+      const clicked = await humanizedClick(intermediateLink, "arena-navigation-intermediate");
+      logAutoCombatDiagnostic("arena-navigation-intermediate-result", { clicked, href });
+      if (!clicked) {
+        releaseAutomationNavigation("arena");
+        arenaAutomationState.phase = "checking";
+        arenaAutomationState.error = "Regular Arena navigation control disappeared before the click could be performed; retrying.";
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(500, "arena-intermediate-click-failed");
+      }
+    } else {
+      logAutoCombatDiagnostic("arena-navigation-intermediate-fallback", { step: "regular-arena", href });
+      location.href = href;
     }
     return false;
   }
 
-  async function requestNewArenaOpponents() {
+  async function requestNewArenaOpponents(reason = null) {
     const form = document.querySelector('form[name="filterForm"][action*="getNewOpponents"][action*="aType=2"]');
     const submit = form?.querySelector('input[type="submit"][name="actionButton"]') || form?.querySelector("input[type=submit]");
     if (!form || !submit) return false;
+    const currentCooldownMs = arenaCooldownMs();
+    if (Number.isFinite(currentCooldownMs) && currentCooldownMs > 0) {
+      arenaAutomationState.phase = "waiting-cooldown";
+      arenaAutomationState.error = `Waiting for Arena availability · ${formatExpeditionCooldown(currentCooldownMs)}.`;
+      setModuleReadiness("arena", currentCooldownMs);
+      await saveArenaAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("arena-opponent-refresh-blocked-cooldown", { cooldownMs: currentCooldownMs, reason: reason || null });
+      scheduleAutoCombatResume(Math.max(25, currentCooldownMs + 25), "arena-refresh-cooldown");
+      return false;
+    }
     arenaAutomationState.phase = "refreshing";
-    arenaAutomationState.error = "All five visible opponents have already been attempted; requesting a fresh opponent set.";
+    arenaAutomationState.error = reason || "All five visible opponents have already been attempted; requesting a fresh opponent set.";
     await saveArenaAutomationState();
     renderAutoCombatUI();
     stopArenaAutomationTimer();
+    const previousSearches = Math.max(0, Number(arenaAutomationState.opponentSearches) || 0);
+    arenaAutomationState.opponentSearches = previousSearches + 1;
+    await saveArenaAutomationState();
+    logAutoCombatDiagnostic("arena-opponent-refresh-start", {
+      searchNumber: arenaAutomationState.opponentSearches,
+      reason: reason || null
+    });
     const clicked = await humanizedClick(submit, "arena-refresh-opponents");
-    if (clicked) scheduleAutoCombatResume(500, "arena-opponent-refresh-settle");
+    if (clicked) {
+      scheduleAutoCombatResume(500, "arena-opponent-refresh-settle");
+    }
     if (!clicked) {
+      arenaAutomationState.opponentSearches = previousSearches;
       arenaAutomationState.phase = "checking";
       arenaAutomationState.error = "Search control disappeared before the click could be performed; retrying.";
       await saveArenaAutomationState();
@@ -5883,7 +6594,7 @@ ${warnings}`
       const maxRuns = Math.max(1, Math.min(ARENA_MAX_RUNS, Number(runsInput?.value) || arenaAutomationState.maxRuns || 100));
       arenaReportWaitStartedAt = 0;
       arenaAutomationState = {
-        enabled: true, maxRuns, completedRuns: 0, attemptedOpponents: {},
+        enabled: true, maxRuns, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {},
         pendingTargetKey: null, pendingTargetName: "", pendingReportId: null,
         readiness: "unknown", readyAt: null,
           phase: "starting", startedAt: new Date().toISOString(), error: null
@@ -5904,6 +6615,9 @@ ${warnings}`
     if (!id || id === arenaAutomationState.pendingReportId) return;
     arenaAutomationState.pendingReportId = id;
     arenaAutomationState.completedRuns = Math.min(arenaAutomationState.maxRuns, (Number(arenaAutomationState.completedRuns) || 0) + 1);
+    const postBattleDecision = buildAutoCombatPostBattleDecision("arena", id, arenaAutomationState.completedRuns, arenaAutomationState.maxRuns);
+    arenaAutomationState.lastBattle = postBattleDecision;
+    logAutoCombatDiagnostic("arena-post-battle-decision", postBattleDecision);
     arenaAutomationState.pendingTargetKey = null;
     arenaAutomationState.pendingTargetName = "";
     if (arenaAutomationState.completedRuns >= arenaAutomationState.maxRuns) {
@@ -5996,9 +6710,53 @@ ${warnings}`
       return;
     }
 
-    logAutoCombatDiagnostic("arena-page-ready", {});
+    const arenaRefreshPage = isArenaOpponentRefreshPage() && arenaAutomationState.phase === "refreshing";
+    if (arenaRefreshPage) {
+      const refreshCooldownMs = arenaCooldownMs();
+      logAutoCombatDiagnostic("arena-opponent-refresh-cooldown-check", {
+        cooldownMs: refreshCooldownMs,
+        url: location.href
+      });
+      if (!Number.isFinite(refreshCooldownMs)) {
+        arenaAutomationState.error = "Waiting for the Arena cooldown to appear after requesting new opponents.";
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(350, "arena-opponent-refresh-wait-cooldown");
+        return;
+      }
+      if (refreshCooldownMs > 0) {
+        arenaAutomationState.phase = "waiting-cooldown";
+        arenaAutomationState.error = `Waiting for Arena availability · ${formatExpeditionCooldown(refreshCooldownMs)}.`;
+        setModuleReadiness("arena", refreshCooldownMs);
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("arena-opponent-refresh-cooldown-detected", { cooldownMs: refreshCooldownMs });
+        scheduleAutoCombatResume(Math.max(25, refreshCooldownMs + 25), "arena-refresh-cooldown");
+        return;
+      }
+      const refreshedOpponents = parseArenaOpponents();
+      logAutoCombatDiagnostic("arena-opponent-refresh-page-ready", {
+        opponentCount: refreshedOpponents.length,
+        url: location.href
+      });
+      if (!refreshedOpponents.length) {
+        arenaAutomationState.error = "Waiting for the refreshed Arena opponent list to finish loading.";
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        scheduleAutoCombatResume(350, "arena-opponent-refresh-wait-list");
+        return;
+      }
+      arenaAutomationState.phase = "checking";
+      arenaAutomationState.error = null;
+      setModuleReadiness("arena", 0);
+      await saveArenaAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("arena-opponent-refresh-page-accepted", { opponentCount: refreshedOpponents.length });
+    }
+    logAutoCombatDiagnostic("arena-page-ready", { refreshPage: arenaRefreshPage });
     const analysis = await analyzeCurrentArenaOpponents();
     logAutoCombatDiagnostic("arena-opponent-analysis", { ok: analysis?.ok, completed: analysis?.completed, total: analysis?.total, failures: analysis?.failures, playerHp: analysis?.playerHp });
+    await recordOpponentAnalysisSnapshot("arena", parseArenaOpponents(), arenaOpponentAnalysisStore);
     if (!analysis?.ok) {
       arenaAutomationState.enabled = false;
       arenaAutomationState.phase = "error";
@@ -6008,6 +6766,32 @@ ${warnings}`
       await saveArenaAutomationState();
       renderAutoCombatUI();
       logAutoCombatDiagnostic("arena-analysis-blocked", { reason: analysis?.reason || null, error: arenaAutomationState.error });
+      return;
+    }
+    const arenaLowWinRateSafeguard = lowWinRateOpponentSetSafeguard(
+      "arena",
+      parseArenaOpponents(),
+      arenaOpponentAnalysisStore,
+      arenaOpponentIsAttempted
+    );
+    logAutoCombatDiagnostic("arena-win-rate-safeguard-check", arenaLowWinRateSafeguard);
+    if (arenaLowWinRateSafeguard.triggered) {
+      const threshold = arenaLowWinRateSafeguard.threshold;
+      const refreshed = await requestNewArenaOpponents(
+        `All ${arenaLowWinRateSafeguard.candidates.length} unattempted Arena opponents are below the ${threshold}% minimum win-rate threshold; requesting a fresh opponent set.`
+      );
+      if (refreshed) {
+        logAutoCombatDiagnostic("arena-win-rate-safeguard-triggered", arenaLowWinRateSafeguard);
+        return;
+      }
+      arenaAutomationState.enabled = false;
+      arenaAutomationState.phase = "error";
+      arenaAutomationState.pendingTargetKey = null;
+      arenaAutomationState.pendingTargetName = "";
+      arenaAutomationState.error = "The minimum Arena opponent win-rate safeguard triggered, but the Search for opponents control could not be clicked.";
+      await saveArenaAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("arena-win-rate-safeguard-search-failed", arenaLowWinRateSafeguard);
       return;
     }
     const simHeal = arenaNeedsSimulatorHealing();
@@ -6023,6 +6807,7 @@ ${warnings}`
     const target = chooseArenaTarget();
     logAutoCombatDiagnostic("arena-target-selection", {
       selected: target ? { key: target.key, name: target.name, level: target.level, province: target.province, playerId: target.playerId } : null,
+      selectionPolicy: "highest win rate, then lowest expected damage taken, then shortest expected fight",
       visibleOpponents: parseArenaOpponents().map(opponent => ({ key: opponent.key, name: opponent.name, level: opponent.level, province: opponent.province, playerId: opponent.playerId }))
     });
     if (!target) {
@@ -6251,6 +7036,14 @@ ${warnings}`
     for (const module of modules) {
       const state = autoCombatModuleState(module);
       if (continuations.has(state?.phase)) return module;
+      if (state?.phase === "refreshing") {
+        const refreshPage = module === "arena"
+          ? isArenaOpponentRefreshPage()
+          : module === "provinciarum"
+            ? isCircusProvinciarumOpponentRefreshPage()
+            : false;
+        if (refreshPage) return module;
+      }
     }
     return null;
   }
@@ -6529,7 +7322,7 @@ ${warnings}`
         return `<div class="ga-auto-arena-analysis" style="margin-top:9px">
           <div class="ga-card-head"><div><h3 class="ga-subsection-title">Arena Opponent Analysis</h3><div class="ga-muted">${arenaAnalysisBusy ? "Analyzing all five opponents…" : `15-round Arena simulation · ${analysisRows.filter(Boolean).length}/${rows.length} opponents analyzed${hp ? ` · Your HP ${hp.current}/${hp.max}` : ""}`}</div></div><button class="ga-secondary" id="ga-auto-arena-analyze" type="button" ${analysisButtonDisabled ? "disabled" : ""}>${arenaAnalysisBusy ? "Analyzing…" : "Analyze Now"}</button></div>
           ${simHeal.needed ? `<div class="ga-statusline" style="color:#fbbf24">Simulator recommends healing: up to ${simHeal.maxImpact.toFixed(1)} percentage-point win-rate loss from current HP.</div>` : ""}
-          <div class="ga-arena-analysis-list">${analysisRows.map((row, i) => row?.ok ? `<div class="ga-arena-analysis-row"><span>${esc(rows[i]?.name || row.name)} · Lv ${esc(rows[i]?.level ?? "—")}</span><strong>${esc((Number(row.current?.winRate || 0)).toFixed(1))}%</strong><span class="ga-muted">HP ${esc(row.currentHp?.enemy ?? "—")}/${esc(row.currentHp?.enemyMax ?? "—")}</span></div>` : `<div class="ga-arena-analysis-row"><span>${esc(rows[i]?.name || "Opponent")}</span><span class="ga-muted">${esc(row?.error || (arenaAnalysisBusy ? "Analyzing…" : "Not analyzed yet."))}</span></div>`).join("")}</div>
+          <div class="ga-arena-analysis-list">${analysisRows.map((row, i) => row?.ok ? `<div class="ga-arena-analysis-row"><span><strong>${esc(rows[i]?.name || row.name)}</strong> · Lv ${esc(rows[i]?.level ?? "—")} <span class="ga-pill">${esc(combatAnalysisConfidenceBand(row.current?.winRate))}</span><small class="ga-muted">Expected damage taken ${esc(formatCombatMetric(row.current?.avgEnemyDamage, 1))}</small></span><strong>${esc((Number(row.current?.winRate || 0)).toFixed(1))}%</strong><span class="ga-muted">HP ${esc(row.currentHp?.enemy ?? "—")}/${esc(row.currentHp?.enemyMax ?? "—")}</span></div>` : `<div class="ga-arena-analysis-row"><span>${esc(rows[i]?.name || "Opponent")}</span><span class="ga-muted">${esc(row?.error || (arenaAnalysisBusy ? "Analyzing…" : "Not analyzed yet."))}</span></div>`).join("")}</div>
           <div class="ga-muted" style="margin-top:6px">Manual analysis only fetches profiles and runs simulations; it does not start Auto Combat or click an Arena opponent.</div>
         </div>`;
       })() : ""}
@@ -6540,7 +7333,7 @@ ${warnings}`
         const analyzed = analysisRows.filter(row => row?.ok).length;
         return `<div class="ga-auto-arena-analysis" style="margin-top:9px">
           <div class="ga-card-head"><div><h3 class="ga-subsection-title">Circus Provinciarum 5v5 Opponent Analysis</h3><div class="ga-muted">${circusProvinciarumAnalysisBusy ? "Capturing five fighters and simulating…" : `50-round 5v5 simulation · ${analyzed}/${rows.length} opponents analyzed`}</div></div><button class="ga-secondary" id="ga-auto-provinciarum-analyze" type="button" ${analysisButtonDisabled ? "disabled" : ""}>${circusProvinciarumAnalysisBusy ? "Analyzing…" : "Analyze Now"}</button></div>
-          <div class="ga-arena-analysis-list">${analysisRows.map((row, i) => row?.ok ? `<div class="ga-arena-analysis-row"><span>${esc(rows[i]?.name || row.name)} · Lv ${esc(row.level ?? rows[i]?.level ?? "—")} · Province ${esc(row.province ?? rows[i]?.province ?? "—")}</span><strong>${esc((Number(row.current?.winRate || 0)).toFixed(1))}%</strong><span class="ga-muted">5 fighters · doll 1 excluded</span></div>` : `<div class="ga-arena-analysis-row"><span>${esc(rows[i]?.name || "Opponent")}</span><span class="ga-muted">${esc(row?.error || (circusProvinciarumAnalysisBusy ? "Analyzing…" : "Not analyzed yet."))}</span></div>`).join("")}</div>
+          <div class="ga-arena-analysis-list">${analysisRows.map((row, i) => row?.ok ? `<div class="ga-arena-analysis-row"><span><strong>${esc(rows[i]?.name || row.name)}</strong> · Lv ${esc(row.level ?? rows[i]?.level ?? "—")} · Province ${esc(row.province ?? rows[i]?.province ?? "—")} <span class="ga-pill">${esc(combatAnalysisConfidenceBand(row.current?.winRate))}</span><small class="ga-muted">Expected team damage taken ${esc(formatCombatMetric(row.current?.avgEnemyDamage, 1))}</small></span><strong>${esc((Number(row.current?.winRate || 0)).toFixed(1))}%</strong><span class="ga-muted">5 fighters · doll 1 excluded</span></div>` : `<div class="ga-arena-analysis-row"><span>${esc(rows[i]?.name || "Opponent")}</span><span class="ga-muted">${esc(row?.error || (circusProvinciarumAnalysisBusy ? "Analyzing…" : "Not analyzed yet."))}</span></div>`).join("")}</div>
           <div class="ga-muted" style="margin-top:6px">Each opponent is simulated against your saved Circus team as a full 5v5 battle. The opponent's Arena/Standard Battle character (doll 1) is never captured or simulated.</div>
         </div>`;
       })() : ""}
@@ -6632,6 +7425,9 @@ ${warnings}`
       arenaAutomationState.pendingTargetName = "";
       arenaAutomationState.pendingReportId = null;
       arenaAutomationState.completedRuns = 0;
+      arenaAutomationState.opponentSearches = 0;
+      arenaAutomationState.bestObservedWinRate = null;
+      arenaAutomationState.lastBattle = null;
       arenaAutomationState.phase = "stopped";
       arenaAutomationState.error = null;
       await saveArenaAutomationState();
@@ -6649,6 +7445,9 @@ ${warnings}`
       circusProvinciarumAutomationState.reportWaitStartedAt = null;
       circusProvinciarumAutomationState.reportWaitAttempts = 0;
       circusProvinciarumAutomationState.completedRuns = 0;
+      circusProvinciarumAutomationState.opponentSearches = 0;
+      circusProvinciarumAutomationState.bestObservedWinRate = null;
+      circusProvinciarumAutomationState.lastBattle = null;
       circusProvinciarumAutomationState.phase = "stopped";
       circusProvinciarumAutomationState.error = null;
       await saveCircusProvinciarumAutomationState();
@@ -6734,6 +7533,9 @@ ${warnings}`
       arenaAutomationState.pendingTargetName = "";
       arenaAutomationState.pendingReportId = null;
       arenaAutomationState.completedRuns = 0;
+      arenaAutomationState.opponentSearches = 0;
+      arenaAutomationState.bestObservedWinRate = null;
+      arenaAutomationState.lastBattle = null;
       arenaAutomationState.phase = "stopped";
       arenaAutomationState.error = null;
       await saveArenaAutomationState();
@@ -7911,6 +8713,9 @@ ${warnings}`
         maxRuns: arenaAutomationState.maxRuns || 0,
         pendingTargetKey: arenaAutomationState.pendingTargetKey || null,
         pendingTargetName: arenaAutomationState.pendingTargetName || "",
+        opponentSearches: arenaAutomationState.opponentSearches || 0,
+        bestObservedWinRate: Number.isFinite(Number(arenaAutomationState.bestObservedWinRate)) ? Number(arenaAutomationState.bestObservedWinRate) : null,
+        lastBattle: arenaAutomationState.lastBattle || null,
         error: arenaAutomationState.error || null
       } : null,
       provinciarum: circusProvinciarumAutomationState ? {
@@ -7922,6 +8727,9 @@ ${warnings}`
         maxRuns: circusProvinciarumAutomationState.maxRuns || 0,
         pendingTargetKey: circusProvinciarumAutomationState.pendingTargetKey || null,
         pendingTargetName: circusProvinciarumAutomationState.pendingTargetName || "",
+        opponentSearches: circusProvinciarumAutomationState.opponentSearches || 0,
+        bestObservedWinRate: Number.isFinite(Number(circusProvinciarumAutomationState.bestObservedWinRate)) ? Number(circusProvinciarumAutomationState.bestObservedWinRate) : null,
+        lastBattle: circusProvinciarumAutomationState.lastBattle || null,
         pendingReportId: circusProvinciarumAutomationState.pendingReportId || null,
         lastProcessedReportId: circusProvinciarumAutomationState.lastProcessedReportId || null,
         reportWaitReportId: circusProvinciarumAutomationState.reportWaitReportId || null,
@@ -8518,7 +9326,7 @@ ${warnings}`
     return {
       simulationCount: 50,
       stats: { level: 33, strength: 89, dexterity: 114, agility: 136, constitution: 66, charisma: 61, intelligence: 50, armour: 1763, damage: 122 },
-      automation: { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, healingBagNumber: 514, avoidHealingOverheal: true, postBattleLootAction: "thorough" },
+      automation: { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, minimumOpponentWinRatePercent: 50, healingBagNumber: 514, avoidHealingOverheal: true, postBattleLootAction: "thorough" },
       routine: ["expedition", "dungeon", "circus"],
       diagnosticCaptureEnabled: false,
       targets: [
@@ -8529,10 +9337,11 @@ ${warnings}`
   }
 
   function normalizeAutomationSettings(rawAutomation = {}) {
-    const defaults = { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, healingBagNumber: 514, avoidHealingOverheal: true, avoidHealingOverhealExplicit: false, postBattleLootAction: "thorough" };
+    const defaults = { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, minimumOpponentWinRatePercent: 50, healingBagNumber: 514, avoidHealingOverheal: true, avoidHealingOverhealExplicit: false, postBattleLootAction: "thorough" };
     const rawMin = Number(rawAutomation?.preActionDelayMinMs);
     const rawMax = Number(rawAutomation?.preActionDelayMaxMs);
     const rawThreshold = Number(rawAutomation?.minimumHpThresholdPercent);
+    const rawOpponentWinRate = Number(rawAutomation?.minimumOpponentWinRatePercent);
     const rawBag = Number(rawAutomation?.healingBagNumber);
     const rawLootAction = String(rawAutomation?.postBattleLootAction || "").toLowerCase().trim();
     const postBattleLootAction = ["return", "quick", "thorough"].includes(rawLootAction) ? rawLootAction : defaults.postBattleLootAction;
@@ -8549,8 +9358,9 @@ ${warnings}`
     const min = Number.isFinite(rawMin) ? Math.max(0, Math.min(60000, Math.trunc(rawMin))) : defaults.preActionDelayMinMs;
     const max = Number.isFinite(rawMax) ? Math.max(0, Math.min(60000, Math.trunc(rawMax))) : defaults.preActionDelayMaxMs;
     const minimumHpThresholdPercent = Number.isFinite(rawThreshold) ? Math.max(0, Math.min(100, Math.trunc(rawThreshold))) : defaults.minimumHpThresholdPercent;
+    const minimumOpponentWinRatePercent = Number.isFinite(rawOpponentWinRate) ? Math.max(0, Math.min(100, Math.trunc(rawOpponentWinRate))) : defaults.minimumOpponentWinRatePercent;
     const healingBagNumber = Number.isFinite(rawBag) ? Math.max(1, Math.min(AUTO_HEALING_MAX_BAG_NUMBER, Math.trunc(rawBag))) : defaults.healingBagNumber;
-    const normalized = { preActionDelayMinMs: min, preActionDelayMaxMs: max, minimumHpThresholdPercent, healingBagNumber, avoidHealingOverheal, avoidHealingOverhealExplicit: explicitPreference, postBattleLootAction };
+    const normalized = { preActionDelayMinMs: min, preActionDelayMaxMs: max, minimumHpThresholdPercent, minimumOpponentWinRatePercent, healingBagNumber, avoidHealingOverheal, avoidHealingOverhealExplicit: explicitPreference, postBattleLootAction };
     if (min > max) {
       normalized.preActionDelayMinMs = max;
       normalized.preActionDelayMaxMs = min;
@@ -8594,6 +9404,11 @@ ${warnings}`
   function globalSimulationCount() {
     const n = Number(settings?.simulationCount);
     return Math.max(1, Math.min(10000, Number.isFinite(n) ? Math.trunc(n) : 50));
+  }
+
+  function minimumOpponentWinRateThresholdPercent() {
+    const n = Number(settings?.automation?.minimumOpponentWinRatePercent);
+    return Math.max(0, Math.min(100, Number.isFinite(n) ? n : 50));
   }
 
   function diagnosticCaptureEnabled() {
@@ -9925,9 +10740,14 @@ ${warnings}`
     let storedEquipmentDiagnostic = latestEquipmentDiagnostic;
     if (full && !storedEquipmentDiagnostic) storedEquipmentDiagnostic = await loadLastDiagnostic();
 
+    const equipmentSource = {
+      characterCapture: storedEquipmentDiagnostic,
+      visibleComparisonCapture: auctionComparisonDiagnostics?.lastVisibleEquipmentScan || null
+    };
+
     const allCharacters = masterDiagnosticCharacterProfiles();
     const fullSources = {
-      equipment: storedEquipmentDiagnostic,
+      equipment: equipmentSource,
       auctionScan: latestAuctionDiagnostic || currentAuctionScan?.diagnostics || null,
       characterProfiles: allCharacters,
       expeditionCombat: masterDiagnosticCombatStoreSummary(combatCaptureStore),
@@ -9951,7 +10771,7 @@ ${warnings}`
     };
 
     const sources = full ? fullSources : {
-      equipment: masterDiagnosticSourcePreview(storedEquipmentDiagnostic),
+      equipment: masterDiagnosticSourcePreview(equipmentSource),
       auctionScan: masterDiagnosticSourcePreview(latestAuctionDiagnostic || currentAuctionScan?.diagnostics || null),
       characterProfiles: { count: Object.keys(allCharacters).length, dollIds: Object.keys(allCharacters) },
       expeditionCombat: fullSources.expeditionCombat,
@@ -10231,12 +11051,14 @@ ${warnings}`
       const minInput = automation.querySelector('[data-auto-setting="preActionDelayMinMs"]');
       const maxInput = automation.querySelector('[data-auto-setting="preActionDelayMaxMs"]');
       const hpInput = automation.querySelector('[data-auto-setting="minimumHpThresholdPercent"]');
+      const opponentWinRateInput = automation.querySelector('[data-auto-setting="minimumOpponentWinRatePercent"]');
       const bagInput = automation.querySelector('[data-auto-setting="healingBagNumber"]');
       const lootActionInput = automation.querySelector('[data-auto-setting="postBattleLootAction"]');
       const noOverhealInput = automation.querySelector('[data-auto-setting="avoidHealingOverheal"]');
       if (minInput) minInput.value = range.preActionDelayMinMs;
       if (maxInput) maxInput.value = range.preActionDelayMaxMs;
       if (hpInput) hpInput.value = range.minimumHpThresholdPercent;
+      if (opponentWinRateInput) opponentWinRateInput.value = range.minimumOpponentWinRatePercent;
       if (bagInput) bagInput.value = range.healingBagNumber;
       if (lootActionInput) lootActionInput.value = range.postBattleLootAction;
       if (noOverhealInput) noOverhealInput.checked = !!range.avoidHealingOverheal;
@@ -10280,6 +11102,7 @@ ${warnings}`
       preActionDelayMinMs: Number(shadow.querySelector('[data-auto-setting="preActionDelayMinMs"]')?.value),
       preActionDelayMaxMs: Number(shadow.querySelector('[data-auto-setting="preActionDelayMaxMs"]')?.value),
       minimumHpThresholdPercent: Number(shadow.querySelector('[data-auto-setting="minimumHpThresholdPercent"]')?.value),
+      minimumOpponentWinRatePercent: Number(shadow.querySelector('[data-auto-setting="minimumOpponentWinRatePercent"]')?.value),
       healingBagNumber: Number(shadow.querySelector('[data-auto-setting="healingBagNumber"]')?.value),
       avoidHealingOverheal: !!shadow.querySelector('[data-auto-setting="avoidHealingOverheal"]')?.checked,
       avoidHealingOverhealExplicit: true,
@@ -10289,6 +11112,7 @@ ${warnings}`
     if (previousSimulationCount !== settings.simulationCount) {
       auctionComparisonCurrentPlayerFingerprint = null;
       invalidateAuctionComparisons("global-simulation-count-changed");
+      scheduleNativeEquipmentComparisonScan(60);
       statPriorityState.simulations = globalSimulationCount();
       statPriorityState.result = null;
       statPriorityState.manualResult = null;
@@ -10297,6 +11121,8 @@ ${warnings}`
     }
     renderStats(); renderTargets(); renderTraining();
     renderStatPriorityTab();
+    renderNativeOpponentWinRateBadges();
+    scheduleNativeOpponentWinRateAutoAnalysis();
     const status = shadow.querySelector("#ga-settings-status");
     if (status) { status.textContent = "Saved."; setTimeout(() => { status.textContent = ""; }, 1400); }
   }
@@ -10577,6 +11403,7 @@ ${warnings}`
     const nextEquipmentFingerprint = savedEquipment?.equipment ? auctionComparisonEquipmentFingerprint(savedEquipment.equipment) : null;
     if (previousEquipmentFingerprint && !auctionComparisonFingerprintsMatch(previousEquipmentFingerprint, nextEquipmentFingerprint)) {
       invalidateAuctionComparisons("equipment-storage-change");
+      scheduleNativeEquipmentComparisonScan(80);
     }
     if (profile) {
       renderSelectedCharacterProfile();
@@ -10971,16 +11798,27 @@ ${warnings}`
   });
 
   function auctionCandidateSlot(item) {
-    return AUCTION_EQUIPMENT_CATEGORY_TO_SLOT[String(item?.categoryValue ?? "")] || null;
+    const mappedSlots = Array.isArray(item?.comparisonSlots)
+      ? [...new Set(item.comparisonSlots.map(slot => String(slot || "").trim()).filter(Boolean))]
+      : [];
+    if (mappedSlots.length) {
+      if (mappedSlots.every(slot => /^ring[12]$/.test(slot))) return "ring";
+      if (mappedSlots.length === 1) return mappedSlots[0];
+      return null;
+    }
+    return AUCTION_EQUIPMENT_CATEGORY_TO_SLOT[String(item?.categoryValue ?? item?.auctionCategoryValue ?? "")] || null;
   }
 
   function auctionComparisonItemFingerprint(item) {
     if (!item) return null;
+    // Source-independent identity: the same equipment item may be encountered
+    // in Auction, Inventory, dungeon/expedition rewards, or another item view.
+    // Listing/category metadata is intentionally excluded so those surfaces share
+    // the same persisted comparison result.
     return {
       itemId: item.itemId ?? null,
       itemHash: item.itemHash ?? null,
       itemLevel: item.itemLevel ?? item.level ?? null,
-      categoryValue: item.categoryValue ?? item.auctionCategoryValue ?? null,
       raw: item.raw || null
     };
   }
@@ -11009,16 +11847,25 @@ ${warnings}`
   }
 
   function invalidateAuctionComparisons(reason = "unspecified") {
+    const normalizedReason = String(reason || "unspecified");
+    // Comparison results are now shared across Auction and all other visible
+    // equipment sources. Refreshing an auction listing set must therefore not
+    // invalidate a universal item comparison that another screen/component may
+    // still be consuming. Individual new/changed items receive their own keys.
+    if (["auction-scan-start", "auction-store-storage-change", "auction-gold-icon-storage-change"].includes(normalizedReason)) {
+      recordAuctionComparisonDiagnostic("invalidation-skipped-source-refresh", { reason: normalizedReason }, { persist: true });
+      return false;
+    }
     const state = auctionComparisonState;
     const active = !!state?.running || state?.inFlight?.size > 0 || state?.queue?.length > 0;
     if (active) {
       state.pendingInvalidation = true;
       if (auctionComparisonDiagnostics?.active) auctionComparisonDiagnostics.active.pendingInvalidation = true;
       if (!(state.pendingInvalidationReasons instanceof Set)) state.pendingInvalidationReasons = new Set();
-      state.pendingInvalidationReasons.add(String(reason || "unspecified"));
-      state.forceResimulation = state.forceResimulation || auctionComparisonReasonAffectsPlayer(reason);
+      state.pendingInvalidationReasons.add(normalizedReason);
+      state.forceResimulation = state.forceResimulation || auctionComparisonReasonAffectsPlayer(normalizedReason);
       recordAuctionComparisonDiagnostic("invalidation-deferred", {
-        reason: String(reason || "unspecified"),
+        reason: normalizedReason,
         generation: state.generation,
         running: !!state.running,
         inFlight: state.inFlight.size,
@@ -11039,7 +11886,7 @@ ${warnings}`
     state.pendingInvalidationReasons = new Set();
     state.forceResimulation = auctionComparisonReasonAffectsPlayer(reason);
     recordAuctionComparisonDiagnostic("invalidation-applied", {
-      reason: String(reason || "unspecified"),
+      reason: normalizedReason,
       generation: state.generation
     }, { persist: true });
     return true;
@@ -11074,8 +11921,22 @@ ${warnings}`
     };
   }
 
-  function auctionComparisonResultKey(item) {
+  function auctionComparisonLegacyResultKey(item) {
     return String(item?.listingId || item?.contentFingerprint || item?.itemHash || item?.itemId || `${item?.categoryValue || "x"}:${item?.auctionIndex ?? "x"}`);
+  }
+
+  function auctionComparisonResultKey(item) {
+    const hash = String(item?.itemHash || "").trim();
+    if (hash) return `equipment:${hostnameKey()}:hash:${hash}`;
+    const itemId = String(item?.itemId || "").trim();
+    if (itemId) return `equipment:${hostnameKey()}:id:${itemId}`;
+    const fingerprint = auctionComparisonItemFingerprint(item);
+    if (fingerprint && (fingerprint.itemLevel != null || fingerprint.categoryValue != null || fingerprint.raw)) {
+      try {
+        return `equipment:${hostnameKey()}:fp:${JSON.stringify(fingerprint)}`;
+      } catch (_) {}
+    }
+    return auctionComparisonLegacyResultKey(item);
   }
 
   function auctionComparisonRelativeDelta(delta, baseline) {
@@ -11101,6 +11962,808 @@ ${warnings}`
   }
 
   function auctionComparisonPendingLabel() { return auctionScanInFlight ? "⏳ Waiting for scan" : "⏳ Awaiting completed scan"; }
+
+  function nativeAuctionComparisonDisplay(comparison) {
+    if (!comparison) return null;
+    const delta = Number(comparison.deltaWinRate);
+    const relative = Number(comparison.relativeChange);
+    const status = String(comparison.status || "").trim();
+    const absoluteText = Number.isFinite(delta)
+      ? `${delta > 0 ? "+" : delta < 0 ? "−" : ""}${Math.abs(delta).toFixed(2)} percentage points`
+      : "an unavailable absolute change";
+    const relativeText = Number.isFinite(relative)
+      ? `${relative > 0 ? "+" : relative < 0 ? "−" : ""}${Math.abs(relative).toFixed(2)}% relative`
+      : "a percentage-point change";
+    const baselineText = Number.isFinite(Number(comparison.baselineWinRate)) ? Number(comparison.baselineWinRate).toFixed(1) : "—";
+    const candidateText = Number.isFinite(Number(comparison.candidateWinRate)) ? Number(comparison.candidateWinRate).toFixed(1) : "—";
+    if (status === "sidegrade") {
+      const displayChange = Number.isFinite(relative) ? relative : (Number.isFinite(delta) ? delta : 0);
+      return {
+        arrow: "sidegrade",
+        value: `Sidegrade · ${Math.abs(displayChange).toFixed(1)}%`,
+        state: "sidegrade",
+        color: "#a16207",
+        title: `Simulated win-rate sidegrade: ${absoluteText} (${relativeText}). Baseline ${baselineText}% → candidate ${candidateText}%.`
+      };
+    }
+    if (status !== "upgrade" && status !== "worse") return null;
+    const upgrade = status === "upgrade";
+    const displayChange = Number.isFinite(relative) ? relative : delta;
+    if (!Number.isFinite(displayChange) || Math.abs(displayChange) < 1e-9) return null;
+    const signed = `${upgrade ? "+" : "−"}${Math.abs(displayChange).toFixed(1)}%`;
+    return {
+      arrow: upgrade ? "up" : "down",
+      value: signed,
+      state: upgrade ? "upgrade" : "downgrade",
+      color: upgrade ? "#16a34a" : "#dc2626",
+      title: `Simulated win-rate change: ${absoluteText} (${relativeText}). Baseline ${baselineText}% → candidate ${candidateText}%.`
+    };
+  }
+
+  function nativeAuctionListingItem(listing, index, categoryValue, byListingId, byHash) {
+    if (!listing) return null;
+    const listingId = auctionListingId(categoryValue, index);
+    const indexed = byListingId.get(listingId) || null;
+    const itemElement = listing.querySelector('[data-tooltip][data-item-id], [data-tooltip][data-hash], [data-tooltip][class*="item-i-"]');
+    const domHash = String(itemElement?.getAttribute("data-hash") || "").trim();
+    if (indexed) {
+      const storedHash = String(indexed.itemHash || "").trim();
+      if (!domHash || !storedHash || domHash === storedHash) return indexed;
+    }
+    if (domHash) {
+      const matches = byHash.get(domHash) || [];
+      if (matches.length === 1) return matches[0];
+    }
+    const autoCandidates = Array.from(nativeEquipmentComparisonCandidates?.values?.() || []).filter(candidate => candidate?.listingId);
+    const autoByListingId = autoCandidates.find(candidate => String(candidate.listingId) === listingId);
+    if (autoByListingId) return autoByListingId;
+    if (domHash) {
+      const autoByHash = autoCandidates.filter(candidate => String(candidate.itemHash || "").trim() === domHash);
+      if (autoByHash.length === 1) return autoByHash[0];
+    }
+    return indexed || null;
+  }
+
+  function findNativeAuctionBidControl(listing) {
+    if (!listing) return null;
+    // The game's auction markup keeps .auction_bid_div next to .auction_item_div
+    // under the same wrapper, rather than inside the item grid itself.
+    const parent = listing.parentElement;
+    const bidRoot =
+      (listing.nextElementSibling?.matches?.('.auction_bid_div') ? listing.nextElementSibling : null) ||
+      (parent ? Array.from(parent.children).find(el => el !== listing && el.classList?.contains('auction_bid_div')) : null) ||
+      listing.querySelector('.auction_bid_div');
+    if (!bidRoot) return null;
+    const controls = Array.from(bidRoot.querySelectorAll('button, input[type="button"], input[type="submit"], a'))
+      .filter(el => {
+        const style = getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden" && (rect.width || rect.height);
+      });
+    const bid = controls.find(el => {
+      const label = String(el.value || el.textContent || el.getAttribute('aria-label') || el.title || '').trim();
+      return /^bid$/i.test(label);
+    });
+    if (bid) return bid;
+    // The native auction markup has historically kept the bid submit control
+    // as the fourth child of .auction_bid_div. Keep that as a narrow fallback
+    // for servers where the control text is rendered indirectly.
+    const legacyCandidate = bidRoot.children?.[3];
+    return legacyCandidate instanceof HTMLElement ? legacyCandidate : null;
+  }
+
+  function positionNativeAuctionComparisonIndicator(indicator, listing, anchor) {
+    if (!indicator || !listing) return;
+    const listingRect = listing.getBoundingClientRect();
+    if (!listingRect.width && !listingRect.height) return;
+    const anchorRect = anchor?.getBoundingClientRect?.();
+    let left;
+    let top;
+    if (anchorRect && (anchorRect.width || anchorRect.height)) {
+      left = anchorRect.right + 7;
+      top = anchorRect.top + anchorRect.height / 2;
+      indicator.dataset.position = "bid";
+    } else {
+      left = Math.max(listingRect.left + 8, listingRect.right - 92);
+      top = listingRect.bottom - 9;
+      indicator.dataset.position = "fallback";
+    }
+    indicator.style.left = `${Math.round(left)}px`;
+    indicator.style.top = `${Math.round(top)}px`;
+
+    const source = anchor || listing;
+    try {
+      const sourceStyle = getComputedStyle(source);
+      indicator.style.fontFamily = sourceStyle.fontFamily;
+      indicator.style.fontSize = sourceStyle.fontSize;
+      indicator.style.fontWeight = "700";
+      indicator.style.lineHeight = sourceStyle.lineHeight;
+      indicator.style.letterSpacing = sourceStyle.letterSpacing;
+    } catch (_) {}
+  }
+
+  function renderNativeAuctionComparisonIndicators() {
+    const listings = Array.from(document.querySelectorAll(".auction_item_div"));
+    const category = getCurrentAuctionCategory();
+    const isAuctionPage = !!category.select || listings.length > 0;
+    if (!isAuctionPage) {
+      document.querySelectorAll(".ga-native-auction-compare").forEach(el => el.remove());
+      return;
+    }
+
+    const categoryValue = String(category.value ?? "0");
+    const items = combinedAuctionItems().filter(item => String(item?.categoryValue ?? item?.auctionCategoryValue ?? "") === categoryValue);
+    const byListingId = new Map(items.map(item => [String(item.listingId || auctionListingId(categoryValue, item.auctionIndex)), item]));
+    const byHash = new Map();
+    for (const item of items) {
+      const hash = String(item?.itemHash || "").trim();
+      if (!hash) continue;
+      if (!byHash.has(hash)) byHash.set(hash, []);
+      byHash.get(hash).push(item);
+    }
+
+    const activeIds = new Set();
+    for (let index = 0; index < listings.length; index++) {
+      const listing = listings[index];
+      const item = nativeAuctionListingItem(listing, index, categoryValue, byListingId, byHash);
+      if (!item) continue;
+      const comparison = getAuctionComparison(item);
+      const display = nativeAuctionComparisonDisplay(comparison);
+      if (!display) continue;
+      const listingId = String(item.listingId || auctionListingId(categoryValue, index));
+      activeIds.add(listingId);
+
+      let indicator = document.querySelector(`.ga-native-auction-compare[data-listing-id="${CSS.escape(listingId)}"]`);
+      if (!indicator) {
+        indicator = document.createElement("span");
+        indicator.className = "ga-native-auction-compare";
+        indicator.dataset.listingId = listingId;
+        const arrow = document.createElement("span");
+        arrow.className = "ga-native-auction-compare-arrow";
+        const value = document.createElement("span");
+        value.className = "ga-native-auction-compare-value";
+        indicator.append(arrow, value);
+        (document.body || document.documentElement).appendChild(indicator);
+      }
+
+      const anchor = findNativeAuctionBidControl(listing);
+      const arrow = indicator.querySelector(".ga-native-auction-compare-arrow");
+      const value = indicator.querySelector(".ga-native-auction-compare-value");
+      if (arrow) {
+        arrow.textContent = "";
+        arrow.classList.toggle("ga-native-auction-compare-arrow-up", display.state === "upgrade");
+        arrow.classList.toggle("ga-native-auction-compare-arrow-down", display.state === "downgrade");
+        arrow.classList.toggle("ga-native-auction-compare-arrow-sidegrade", display.state === "sidegrade");
+        arrow.style.color = display.color;
+        arrow.setAttribute("aria-label", display.state === "upgrade" ? "Upgrade" : display.state === "downgrade" ? "Downgrade" : "Sidegrade");
+      }
+      if (value) {
+        value.textContent = display.value;
+        value.style.color = "#000";
+      }
+      indicator.dataset.state = display.state;
+      indicator.title = display.title;
+      positionNativeAuctionComparisonIndicator(indicator, listing, anchor);
+      applyNativeComparisonOcclusion(indicator);
+    }
+
+    document.querySelectorAll(".ga-native-auction-compare").forEach(indicator => {
+      if (!activeIds.has(String(indicator.dataset.listingId || ""))) indicator.remove();
+    });
+  }
+
+  function scheduleNativeAuctionComparisonRender() {
+    if (nativeAuctionComparisonRenderTimer) return;
+    nativeAuctionComparisonRenderTimer = setTimeout(() => {
+      nativeAuctionComparisonRenderTimer = null;
+      renderNativeAuctionComparisonIndicators();
+    }, 0);
+  }
+
+  function initializeNativeAuctionComparisonDisplay() {
+    if (!nativeAuctionComparisonListenersReady) {
+      document.addEventListener("change", event => {
+        if (event.target?.matches?.('select[name="itemType"]')) scheduleNativeAuctionComparisonRender();
+      }, true);
+      document.addEventListener("scroll", () => scheduleNativeAuctionComparisonRender(), true);
+      window.addEventListener("resize", () => scheduleNativeAuctionComparisonRender(), { passive: true });
+      nativeAuctionComparisonListenersReady = true;
+    }
+    if (typeof MutationObserver === "undefined" || !document.body) {
+      renderNativeAuctionComparisonIndicators();
+      return;
+    }
+    if (!nativeAuctionComparisonObserver) {
+      nativeAuctionComparisonObserver = new MutationObserver(records => {
+        if (!getCurrentAuctionCategory().select && !document.querySelector(".auction_item_div")) return;
+        const relevant = records.some(record => {
+          if (record.type !== "childList") return false;
+          const nodes = [...record.addedNodes, ...record.removedNodes];
+          return nodes.some(node => {
+            if (node.nodeType !== 1) return false;
+            if (node.classList?.contains("ga-native-auction-compare")) return false;
+            return true;
+          });
+        });
+        if (relevant) scheduleNativeAuctionComparisonRender();
+      });
+      nativeAuctionComparisonObserver.observe(document.body, { childList: true, subtree: true });
+    }
+    scheduleNativeAuctionComparisonRender();
+  }
+
+
+  function nativeEquipmentComparisonSavedTypeMap() {
+    const map = {};
+    const profiles = characterProfileStore?.characters || {};
+    const preferred = profiles?.["1"] || selectedCharacterProfile?.();
+    const sources = [preferred, ...Object.values(profiles || {})];
+    for (const profile of sources) {
+      for (const [slot, item] of Object.entries(profile?.equipment || {})) {
+        const type = String(item?.contentType || "").trim();
+        if (!type || !SLOT_TO_CONTAINER[slot]) continue;
+        if (!map[type]) map[type] = [];
+        if (!map[type].includes(slot)) map[type].push(slot);
+      }
+    }
+    return map;
+  }
+
+  function nativeEquipmentComparisonSlots(item, parserTypeMap = null) {
+    const auctionCategorySlot = AUCTION_EQUIPMENT_CATEGORY_TO_SLOT[String(item?.categoryValue ?? item?.auctionCategoryValue ?? "")];
+    if (item?.listingId && auctionCategorySlot) return [auctionCategorySlot === "ring" ? "ring1" : auctionCategorySlot];
+    const direct = Array.isArray(item?.comparisonSlots)
+      ? [...new Set(item.comparisonSlots.map(slot => String(slot || "").trim()).filter(Boolean))]
+      : [];
+    const type = String(item?.contentType || "").trim();
+    const mapped = [...new Set([
+      ...(Array.isArray(parserTypeMap?.[type]) ? parserTypeMap[type] : []),
+      ...(Array.isArray(nativeEquipmentComparisonSavedTypeMap()?.[type]) ? nativeEquipmentComparisonSavedTypeMap()[type] : [])
+    ].map(slot => String(slot || "").trim()).filter(Boolean))];
+    const slots = direct.length ? direct : mapped;
+    if (slots.length) {
+      const unique = [...new Set(slots)];
+      if (unique.every(slot => /^ring[12]$/.test(slot))) return ["ring1", "ring2"];
+      if (unique.length === 1) return unique;
+    }
+    const auctionSlot = AUCTION_EQUIPMENT_CATEGORY_TO_SLOT[String(item?.categoryValue ?? item?.auctionCategoryValue ?? "")];
+    return auctionSlot ? [auctionSlot === "ring" ? "ring1" : auctionSlot] : [];
+  }
+
+  function nativeVisibleEquipmentSourceKey(node) {
+    if (!node) return "";
+    return [
+      node.closest?.("#packages, #inventory, #inv, .inventory_box, .packageItem, #content, #center, body")?.id || "",
+      node.getAttribute?.("data-container-number") || "",
+      node.getAttribute?.("data-position-x") || "",
+      node.getAttribute?.("data-position-y") || "",
+      node.getAttribute?.("data-item-id") || "",
+      node.getAttribute?.("data-hash") || ""
+    ].join("|");
+  }
+
+  function nativeEquipmentAllElements() {
+    return Array.from(document.querySelectorAll('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]')).filter(node => !node.closest?.("#char, .auction_item_div, .ga-host, #gladiatus-assistant"));
+  }
+
+  function nativeVisibleEquipmentElements() {
+    // Used only for viewport preflight diagnostics. Candidate lookup itself uses
+    // the full DOM so scrolling cannot discard comparisons merely because an item
+    // is temporarily outside the viewport.
+    return nativeEquipmentAllElements().filter(node => {
+      const rect = node.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const style = getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+      return rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+    });
+  }
+
+  function findNativeEquipmentElementForComparison(item) {
+    const nodes = nativeEquipmentAllElements();
+    if (!nodes.length) return null;
+    const sourceKey = String(item?.sourceKey || "");
+    if (sourceKey) {
+      const exact = nodes.find(node => nativeVisibleEquipmentSourceKey(node) === sourceKey);
+      if (exact) return exact;
+    }
+    const itemId = String(item?.itemId || "").trim();
+    const itemHash = String(item?.itemHash || "").trim();
+    const candidates = nodes.filter(node => {
+      const id = String(node.getAttribute("data-item-id") || "").trim();
+      const hash = String(node.getAttribute("data-hash") || "").trim();
+      if (itemHash && hash) return hash === itemHash && (!itemId || id === itemId);
+      return itemId && id === itemId;
+    });
+    if (candidates.length === 1) return candidates[0];
+    const posX = String(item?.positionX ?? "").trim();
+    const posY = String(item?.positionY ?? "").trim();
+    if (candidates.length > 1 && (posX || posY)) {
+      return candidates.find(node => String(node.getAttribute("data-position-x") || "").trim() === posX && String(node.getAttribute("data-position-y") || "").trim() === posY) || candidates[0];
+    }
+    return candidates[0] || null;
+  }
+
+  function nativeComparisonIndicatorOccluded(indicator) {
+    if (!indicator?.isConnected) return false;
+    const rect = indicator.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+    const overlayLike = element => {
+      if (!element?.matches) return false;
+      const token = `${String(element.id || "")} ${String(element.className || "")}`.toLowerCase();
+      return element.getAttribute?.("role") === "tooltip" ||
+        element.getAttribute?.("role") === "dialog" ||
+        /(?:^|[-_ ])(?:tooltip|ui-tooltip|popup|dialog|blackoutdialog|modal)(?:$|[-_ ])/i.test(token);
+    };
+    const visiblyCovers = element => {
+      if (!element || element === indicator || indicator.contains(element)) return false;
+      const style = getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+      const r = element.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.height <= 0) return false;
+      return r.right > rect.left && r.left < rect.right && r.bottom > rect.top && r.top < rect.bottom;
+    };
+    // First use hit-testing. This catches the actual native overlay that is
+    // painted above the indicator without requiring knowledge of its z-index.
+    const points = [
+      [rect.left + rect.width / 2, rect.top + rect.height / 2],
+      [rect.left + Math.min(5, rect.width / 2), rect.top + rect.height / 2]
+    ];
+    if (points.some(([x, y]) => {
+      if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return false;
+      const hit = document.elementFromPoint(x, y);
+      if (!hit || hit === indicator || indicator.contains(hit)) return false;
+      let el = hit;
+      for (let i = 0; el && i < 8; i++, el = el.parentElement) {
+        if (overlayLike(el)) return true;
+      }
+      return false;
+    })) return true;
+
+    // Also detect overlapping tooltip/popup elements even when an unusual
+    // stacking context prevents elementFromPoint() from exposing them.
+    const overlays = document.querySelectorAll('[role="tooltip"], [role="dialog"], [class*="tooltip"], [id*="tooltip"], [class*="popup"], [id*="popup"], [class*="blackoutdialog"], [id*="blackoutdialog"], [class*="modal"], [id*="modal"]');
+    for (const overlay of overlays) {
+      if (overlay === indicator || indicator.contains(overlay) || !overlayLike(overlay)) continue;
+      if (visiblyCovers(overlay)) return true;
+    }
+    return false;
+  }
+
+  function applyNativeComparisonOcclusion(indicator) {
+    if (!indicator) return;
+    indicator.style.display = nativeComparisonIndicatorOccluded(indicator) ? "none" : "inline-flex";
+  }
+
+  function positionNativeEquipmentComparisonIndicator(indicator, itemElement) {
+    if (!indicator || !itemElement) return false;
+    const rect = itemElement.getBoundingClientRect();
+    if (!rect.width && !rect.height) return false;
+    const gap = 7;
+    const width = indicator.offsetWidth || 60;
+    let left = rect.right + gap;
+    if (left + width > innerWidth - 4) left = Math.max(4, rect.left - width - gap);
+    indicator.style.left = `${Math.round(left)}px`;
+    indicator.style.top = `${Math.round(rect.top + rect.height / 2)}px`;
+    try {
+      const style = getComputedStyle(itemElement);
+      indicator.style.fontFamily = style.fontFamily;
+      indicator.style.fontSize = style.fontSize;
+      indicator.style.fontWeight = "700";
+      indicator.style.lineHeight = style.lineHeight;
+      indicator.style.letterSpacing = style.letterSpacing;
+    } catch (_) {}
+    indicator.dataset.anchor = "equipment";
+    return true;
+  }
+
+  function createNativeEquipmentComparisonIndicator(key) {
+    const selector = `.ga-native-equipment-compare[data-equipment-key="${CSS.escape(key)}"]`;
+    let indicator = document.querySelector(selector);
+    if (indicator) return indicator;
+    indicator = document.createElement("span");
+    indicator.className = "ga-native-equipment-compare";
+    indicator.dataset.equipmentKey = key;
+    const arrow = document.createElement("span");
+    arrow.className = "ga-native-equipment-compare-arrow";
+    const value = document.createElement("span");
+    value.className = "ga-native-equipment-compare-value";
+    indicator.append(arrow, value);
+    (document.body || document.documentElement).appendChild(indicator);
+    return indicator;
+  }
+
+  function nativeEquipmentComparisonCandidateForElement(element) {
+    if (!element) return null;
+    const sourceKey = nativeVisibleEquipmentSourceKey(element);
+    const itemId = String(element.getAttribute?.("data-item-id") || "").trim();
+    const itemHash = String(element.getAttribute?.("data-hash") || "").trim();
+    let fallback = null;
+    for (const [key, item] of nativeEquipmentComparisonCandidates.entries()) {
+      if (!item || item?.listingId) continue;
+      if (sourceKey && String(item?.sourceKey || "") === sourceKey) return { key, item };
+      const candidateId = String(item?.itemId || "").trim();
+      const candidateHash = String(item?.itemHash || "").trim();
+      if (itemHash && candidateHash && itemHash === candidateHash && (!itemId || !candidateId || itemId === candidateId)) {
+        if (!fallback) fallback = { key, item };
+      } else if (itemId && candidateId && itemId === candidateId && !fallback) {
+        fallback = { key, item };
+      }
+    }
+    return fallback;
+  }
+
+  function nativeItemTooltipVisible(element) {
+    if (!element || element === document.body || element === document.documentElement) return false;
+    const style = getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    const rect = element.getBoundingClientRect?.();
+    return !!rect && rect.width > 0 && rect.height > 0 && rect.right > 0 && rect.bottom > 0 && rect.left < innerWidth && rect.top < innerHeight;
+  }
+
+  function nativeItemTooltipLike(element) {
+    if (!element?.matches) return false;
+    const token = `${String(element.id || "")} ${String(element.className || "")}`.toLowerCase();
+    const role = String(element.getAttribute?.("role") || "").toLowerCase();
+    if (role === "tooltip") return true;
+    if (/(^|[-_ ])(?:tooltip|ui-tooltip|tip|tip-wrap|item-tooltip)(?:$|[-_ ])/i.test(token)) return true;
+    return token.includes("tooltip") || token.includes("tip-wrap");
+  }
+
+  function nativeItemTooltipTextMatches(element, itemName) {
+    if (!element || !itemName) return false;
+    const text = normalize(element.innerText || element.textContent || "").toLowerCase();
+    const name = normalize(itemName).toLowerCase();
+    return !!name && text.includes(name);
+  }
+
+  function nativeItemTooltipScore(element, itemName) {
+    const rect = element.getBoundingClientRect?.();
+    const style = getComputedStyle(element);
+    let score = 0;
+    if (nativeItemTooltipLike(element)) score += 1000;
+    if (["absolute", "fixed"].includes(style.position)) score += 150;
+    if (nativeItemTooltipTextMatches(element, itemName)) score += 500;
+    if (rect && rect.width > 120 && rect.height > 20) score += 25;
+    if (rect) score -= Math.min(100, (rect.width * rect.height) / 50000);
+    return score;
+  }
+
+  function findNativeItemTooltip(item) {
+    const itemName = String(item?.name || "").trim();
+    if (!itemName || !document.body) return null;
+    const seen = new Set();
+    const candidates = [];
+    const add = element => {
+      if (!element || seen.has(element) || element.closest?.("#gladiatus-assistant")) return;
+      seen.add(element);
+      if (!nativeItemTooltipVisible(element)) return;
+      if (!nativeItemTooltipTextMatches(element, itemName)) return;
+      const style = getComputedStyle(element);
+      if (!nativeItemTooltipLike(element) && !["absolute", "fixed"].includes(style.position)) return;
+      candidates.push(element);
+    };
+
+    const common = document.querySelectorAll('[role="tooltip"], [class*="tooltip"], [id*="tooltip"], [class*="tip-wrap"], [class~="tip"], [id="tooltip"]');
+    common.forEach(add);
+
+    if (!candidates.length) {
+      const all = document.querySelectorAll("div,table,tbody,ul,ol");
+      for (const element of all) {
+        if (candidates.length >= 40) break;
+        add(element);
+      }
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => nativeItemTooltipScore(b, itemName) - nativeItemTooltipScore(a, itemName));
+    let best = candidates[0];
+    // Prefer the outer tooltip container when the current best is a nested
+    // element inside another tooltip-like element containing the same item.
+    let parent = best.parentElement;
+    while (parent && parent !== document.body) {
+      if (nativeItemTooltipVisible(parent) && nativeItemTooltipTextMatches(parent, itemName) && nativeItemTooltipLike(parent)) best = parent;
+      parent = parent.parentElement;
+    }
+    return best;
+  }
+
+  function appendNativeItemComparisonTooltipRow(tooltip, display, item, key) {
+    if (!tooltip || !display || !item) return false;
+    tooltip.querySelectorAll?.(".ga-native-item-tooltip-compare").forEach(row => row.remove());
+    const stateLabel = display.state === "upgrade" ? "Upgrade" : display.state === "downgrade" ? "Worse" : "Sidegrade";
+    const arrowText = display.state === "upgrade" ? "↑" : display.state === "downgrade" ? "↓" : "↔";
+    const makeCell = () => {
+      const cell = document.createElement("td");
+      cell.colSpan = 99;
+      cell.style.cssText = "padding:2px 0 0 0!important;margin:0!important;border:0!important;background:transparent!important;color:inherit!important;font:inherit!important;font-weight:700!important;line-height:inherit!important;text-align:left!important;white-space:nowrap!important;";
+      return cell;
+    };
+    const tag = String(tooltip.tagName || "").toLowerCase();
+    let row;
+    if (tag === "table" || tag === "tbody") {
+      row = document.createElement("tr");
+      const cell = makeCell();
+      row.appendChild(cell);
+      const body = tag === "tbody" ? tooltip : (tooltip.tBodies?.[0] || tooltip.appendChild(document.createElement("tbody")));
+      body.appendChild(row);
+    } else if (tag === "tr") {
+      row = document.createElement("tr");
+      row.appendChild(makeCell());
+      tooltip.parentElement?.appendChild(row);
+    } else {
+      row = document.createElement("div");
+      row.style.cssText = "display:block!important;margin:2px 0 0 0!important;padding:0!important;border:0!important;background:transparent!important;color:inherit!important;font:inherit!important;font-weight:700!important;line-height:inherit!important;white-space:nowrap!important;";
+      tooltip.appendChild(row);
+    }
+    const content = row.tagName?.toLowerCase() === "tr" ? row.firstElementChild : row;
+    if (!content) return false;
+    content.classList.add("ga-native-item-tooltip-compare");
+    content.dataset.equipmentKey = key;
+    content.title = display.title || `${stateLabel}: ${display.value}`;
+    const arrow = document.createElement("span");
+    arrow.textContent = arrowText;
+    arrow.style.cssText = `color:${display.color}!important;font-weight:700!important;margin-right:4px!important;font:inherit!important;`;
+    const textNode = document.createElement("span");
+    textNode.textContent = display.value;
+    textNode.style.cssText = "color:#000!important;font-weight:700!important;font:inherit!important;";
+    content.append(arrow, textNode);
+    return true;
+  }
+
+  function renderNativeItemTooltipComparison() {
+    const element = nativeItemTooltipHoveredElement;
+    if (!element?.isConnected) return;
+    const candidate = nativeEquipmentComparisonCandidates.get(nativeItemTooltipHoveredKey) || nativeEquipmentComparisonCandidateForElement(element);
+    if (!candidate) {
+      scheduleNativeEquipmentComparisonScan(80);
+      return;
+    }
+    if (!nativeItemTooltipHoveredKey) nativeItemTooltipHoveredKey = candidate.key;
+    const comparison = getAuctionComparison(candidate.item);
+    const display = nativeAuctionComparisonDisplay(comparison);
+    if (!display) return;
+    const tooltip = findNativeItemTooltip(candidate.item);
+    if (!tooltip) return;
+    appendNativeItemComparisonTooltipRow(tooltip, display, candidate.item, candidate.key);
+  }
+
+  function scheduleNativeItemTooltipComparisonRender(delay = 40) {
+    if (nativeItemTooltipRenderTimer) clearTimeout(nativeItemTooltipRenderTimer);
+    nativeItemTooltipRenderTimer = setTimeout(() => {
+      nativeItemTooltipRenderTimer = null;
+      renderNativeItemTooltipComparison();
+    }, Math.max(0, Number(delay) || 0));
+  }
+
+  function removeNativeItemTooltipComparisonRows() {
+    document.querySelectorAll(".ga-native-item-tooltip-compare").forEach(row => row.remove());
+  }
+
+  function renderNativeEquipmentComparisonIndicators() {
+    // Generic equipment comparisons are now rendered inside Gladiatus' native
+    // item tooltip. Remove the legacy floating indicators so only one result
+    // is shown and it follows the game's own tooltip positioning.
+    document.querySelectorAll(".ga-native-equipment-compare").forEach(indicator => indicator.remove());
+    scheduleNativeItemTooltipComparisonRender(0);
+  }
+
+  function scheduleNativeEquipmentComparisonRender() {
+    if (nativeAuctionComparisonRenderTimer) return;
+    nativeAuctionComparisonRenderTimer = setTimeout(() => {
+      nativeAuctionComparisonRenderTimer = null;
+      renderNativeAuctionComparisonIndicators();
+      renderNativeEquipmentComparisonIndicators();
+    }, 0);
+  }
+
+  function nativeEquipmentComparisonScanInputItems(result) {
+    const parserTypeMap = result?.typeMap || {};
+    const out = [];
+    for (const raw of Array.isArray(result?.items) ? result.items : []) {
+      if (!raw || typeof raw !== "object") continue;
+      const source = raw?.listingId ? "auction" : "generic-visible";
+      const slots = nativeEquipmentComparisonSlots(raw, parserTypeMap);
+      if (!slots.length) continue;
+      const item = { ...raw, comparisonSlots: slots };
+      if (source === "auction") item.comparisonSlot = slots[0];
+      else item.comparisonSlot = slots.length === 2 && slots.every(slot => /^ring[12]$/.test(slot)) ? "ring" : slots[0];
+      item.nativeSource = source;
+      out.push(item);
+    }
+    return out;
+  }
+
+  function nativeEquipmentDisplayKey(item) {
+    const universalKey = auctionComparisonResultKey(item);
+    const sourceKey = String(item?.listingId || item?.sourceKey || "").trim();
+    return `${universalKey}::${sourceKey || "source"}`;
+  }
+
+  async function runNativeEquipmentComparisonScan() {
+    if (!statPriorityStateLoaded || nativeEquipmentComparisonScanInFlight) return;
+    if (!document.body) return;
+    nativeEquipmentComparisonScanInFlight = true;
+    const scanGeneration = ++nativeEquipmentComparisonScanGeneration;
+    const scanStartedAt = new Date().toISOString();
+    const preflightItemNodes = Array.from(document.querySelectorAll('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]'));
+    const preflightTooltipNodes = Array.from(document.querySelectorAll('[data-tooltip]'));
+    recordAuctionComparisonDiagnostic("generic-visible-capture-start", {
+      generation: scanGeneration,
+      page: {
+        url: location.href,
+        pathname: location.pathname,
+        bodyId: document.body?.id || ""
+      },
+      directItemNodes: preflightItemNodes.length,
+      tooltipNodes: preflightTooltipNodes.length,
+      visibleDirectItemNodes: preflightItemNodes.filter(node => {
+        const rect = node.getBoundingClientRect?.();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        const style = getComputedStyle(node);
+        return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+      }).length
+    }, { persist: true });
+    try {
+      const result = await runtimeSend({ type: "SCAN_VISIBLE_EQUIPMENT_COMPARISON" });
+      if (scanGeneration !== nativeEquipmentComparisonScanGeneration) return;
+      const captureDiagnostic = {
+        ...result?.captureDiagnostics,
+        receivedAt: new Date().toISOString(),
+        startedAt: scanStartedAt,
+        generation: scanGeneration,
+        overlayPreflight: {
+          directItemNodes: preflightItemNodes.length,
+          tooltipNodes: preflightTooltipNodes.length,
+          visibleDirectItemNodes: preflightItemNodes.filter(node => {
+            const rect = node.getBoundingClientRect?.();
+            if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+            const style = getComputedStyle(node);
+            return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+          }).length
+        },
+        parserResult: {
+          examined: Number(result?.examined) || 0,
+          genericCount: Number(result?.genericCount) || 0,
+          auctionCount: Number(result?.auctionCount) || 0,
+          returnedItems: Array.isArray(result?.items) ? result.items.length : 0,
+          genericTypeMapKeys: Object.keys(result?.typeMap || {}).length
+        }
+      };
+      auctionComparisonDiagnostics.lastVisibleEquipmentScan = captureDiagnostic;
+      recordAuctionComparisonDiagnostic("generic-visible-scan", captureDiagnostic, { persist: true });
+      const items = nativeEquipmentComparisonScanInputItems(result);
+      const seen = new Set();
+      for (const item of items) {
+        const key = nativeEquipmentDisplayKey(item);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        nativeEquipmentComparisonCandidates.set(key, item);
+        scheduleAuctionComparison(item);
+      }
+      for (const [key, item] of nativeEquipmentComparisonCandidates.entries()) {
+        if (item?.listingId) {
+          const index = Number(item.auctionIndex);
+          const listings = document.querySelectorAll?.(".auction_item_div") || [];
+          if (!listings.length || (Number.isFinite(index) && !listings[index])) nativeEquipmentComparisonCandidates.delete(key);
+          continue;
+        }
+        const liveElement = findNativeEquipmentElementForComparison(item);
+        if (!liveElement) nativeEquipmentComparisonCandidates.delete(key);
+      }
+      if (items.length) auctionComparisonState.forceResimulation = false;
+      scheduleNativeEquipmentComparisonRender();
+    } catch (error) {
+      const failureDiagnostic = {
+        receivedAt: new Date().toISOString(),
+        startedAt: scanStartedAt,
+        generation: scanGeneration,
+        error: {
+          message: error?.message || String(error),
+          name: error?.name || null,
+          stack: error?.stack || null
+        },
+        overlayPreflight: {
+          directItemNodes: preflightItemNodes.length,
+          tooltipNodes: preflightTooltipNodes.length,
+          visibleDirectItemNodes: preflightItemNodes.filter(node => {
+            const rect = node.getBoundingClientRect?.();
+            if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+            const style = getComputedStyle(node);
+            return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && rect.bottom > 0 && rect.top < innerHeight && rect.right > 0 && rect.left < innerWidth;
+          }).length
+        }
+      };
+      auctionComparisonDiagnostics.lastVisibleEquipmentScan = failureDiagnostic;
+      recordAuctionComparisonDiagnostic("generic-visible-capture-error", failureDiagnostic, { persist: true });
+      // A transient page transition can tear down the parser listener. The observer
+      // will retry when the page settles; surface the failure in master diagnostics.
+    } finally {
+      nativeEquipmentComparisonScanInFlight = false;
+    }
+  }
+
+  function scheduleNativeEquipmentComparisonScan(delay = 120) {
+    if (!statPriorityStateLoaded) return;
+    if (nativeEquipmentComparisonScanTimer) clearTimeout(nativeEquipmentComparisonScanTimer);
+    nativeEquipmentComparisonScanTimer = setTimeout(() => {
+      nativeEquipmentComparisonScanTimer = null;
+      void runNativeEquipmentComparisonScan();
+    }, Math.max(0, Number(delay) || 0));
+  }
+
+  function initializeNativeEquipmentComparisonDisplay() {
+    if (!nativeEquipmentComparisonListenersReady) {
+      document.addEventListener("scroll", () => {
+        scheduleNativeEquipmentComparisonScan(160);
+        scheduleNativeEquipmentComparisonRender();
+      }, true);
+      document.addEventListener("mouseover", event => {
+        const itemElement = event.target?.closest?.('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]');
+        if (!itemElement || itemElement.closest?.("#char, .auction_item_div, .ga-host, #gladiatus-assistant")) return;
+        if (nativeItemTooltipHoveredElement === itemElement) {
+          scheduleNativeItemTooltipComparisonRender(70);
+          return;
+        }
+        nativeItemTooltipHoveredElement = itemElement;
+        const candidate = nativeEquipmentComparisonCandidateForElement(itemElement);
+        nativeItemTooltipHoveredKey = candidate?.key || "";
+        if (!candidate) scheduleNativeEquipmentComparisonScan(60);
+        scheduleNativeItemTooltipComparisonRender(70);
+      }, true);
+      document.addEventListener("mouseout", event => {
+        const itemElement = event.target?.closest?.('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]');
+        if (!itemElement || itemElement !== nativeItemTooltipHoveredElement) return;
+        const related = event.relatedTarget;
+        if (related && itemElement.contains?.(related)) return;
+        nativeItemTooltipHoveredElement = null;
+        nativeItemTooltipHoveredKey = "";
+        scheduleNativeItemTooltipComparisonRender(50);
+      }, true);
+      window.addEventListener("resize", () => scheduleNativeEquipmentComparisonRender(), { passive: true });
+      nativeEquipmentComparisonListenersReady = true;
+    }
+    if (!nativeEquipmentComparisonObserver && typeof MutationObserver !== "undefined" && document.body) {
+      nativeEquipmentComparisonObserver = new MutationObserver(records => {
+        let needsScan = false;
+        let needsRender = false;
+        const looksLikeOverlayNode = node => {
+          if (!node?.matches) return false;
+          const token = `${String(node.id || "")} ${String(node.className || "")}`.toLowerCase();
+          return node.getAttribute?.("role") === "tooltip" || node.getAttribute?.("role") === "dialog" || /(?:^|[-_ ])(?:tooltip|ui-tooltip|popup|dialog|blackoutdialog)(?:$|[-_ ])/i.test(token);
+        };
+        const containsEquipmentNode = node => {
+          if (node.nodeType !== 1) return false;
+          if (node.closest?.("#gladiatus-assistant")) return false;
+          if (node.matches?.('[data-tooltip], [data-item-id][class*="item-i-"], [data-hash][class*="item-i-"], .auction_item_div')) return true;
+          return !!node.querySelector?.('[data-tooltip], [data-item-id][class*="item-i-"], [data-hash][class*="item-i-"], .auction_item_div');
+        };
+        for (const record of records) {
+          if (record.type === "attributes") {
+            if (record.target?.closest?.("#gladiatus-assistant")) continue;
+            if (["data-item-id", "data-tooltip", "data-hash"].includes(record.attributeName)) needsScan = true;
+            else if (record.attributeName === "class" && record.target?.matches?.('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"], .auction_item_div, [data-tooltip]')) needsScan = true;
+            continue;
+          }
+          if (record.type !== "childList") continue;
+          const nodes = [...record.addedNodes, ...record.removedNodes].filter(node => node.nodeType === 1);
+          for (const node of nodes) {
+            if (node.classList?.contains("ga-native-auction-compare") || node.classList?.contains("ga-native-equipment-compare")) continue;
+            if (node.closest?.("#gladiatus-assistant")) continue;
+            if (looksLikeOverlayNode(node)) { needsRender = true; continue; }
+            if (containsEquipmentNode(node)) needsScan = true;
+          }
+        }
+        if (needsScan) scheduleNativeEquipmentComparisonScan(180);
+        if (needsScan || needsRender) scheduleNativeEquipmentComparisonRender();
+        if (nativeItemTooltipHoveredElement && (needsRender || needsScan || records.some(record => record.type === "characterData" || record.type === "childList"))) {
+          scheduleNativeItemTooltipComparisonRender(30);
+        }
+      });
+      nativeEquipmentComparisonObserver.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["data-item-id", "data-tooltip", "data-hash", "class"] });
+    }
+    scheduleNativeEquipmentComparisonScan(60);
+    scheduleNativeEquipmentComparisonRender();
+  }
 
   function auctionComparisonStatDifferences(candidate, current) {
     const labels = {
@@ -11285,12 +12948,23 @@ ${warnings}`
   }
 
   function auctionComparisonFingerprintsMatch(a, b) {
-    try { return JSON.stringify(a ?? null) === JSON.stringify(b ?? null); } catch (_) { return false; }
+    try {
+      const normalize = value => {
+        if (!value || typeof value !== "object") return value ?? null;
+        const out = { ...value };
+        delete out.categoryValue;
+        delete out.auctionCategoryValue;
+        return out;
+      };
+      return JSON.stringify(normalize(a)) === JSON.stringify(normalize(b));
+    } catch (_) { return false; }
   }
 
   function auctionComparisonPersistentEntry(item, { ignorePlayerFingerprint = false } = {}) {
     const key = auctionComparisonResultKey(item);
-    const entry = auctionComparisonPersistentResults.get(key);
+    const legacyKey = auctionComparisonLegacyResultKey(item);
+    const entry = auctionComparisonPersistentResults.get(key)
+      || (legacyKey !== key ? auctionComparisonPersistentResults.get(legacyKey) : null);
     if (!entry || !entry.result) return null;
     const currentFingerprint = auctionComparisonItemFingerprint(item);
     if (!auctionComparisonFingerprintsMatch(entry.itemFingerprint, currentFingerprint)) return null;
@@ -11652,6 +13326,7 @@ ${warnings}`
         } catch (error) {
           if (state !== auctionComparisonState || state.generation !== job.generation) break;
           state.cache.set(job.key, { status: "error", statusLabel: "⚠ Unavailable", error: error?.message || String(error) });
+          scheduleNativeEquipmentComparisonRender();
           setAuctionComparisonDiagnosticStage("comparison-error", {
             name: error?.name || null,
             message: error?.message || String(error),
@@ -11669,6 +13344,7 @@ ${warnings}`
           continue;
         }
         renderAuctionList();
+        scheduleNativeEquipmentComparisonRender();
         setAuctionComparisonDiagnosticStage("queue-job-complete", { queueRemaining: state.queue.length, cacheSize: state.cache.size, inFlight: state.inFlight.size }, false);
         await new Promise(resolve => requestAnimationFrame(resolve));
       }
@@ -11699,6 +13375,7 @@ ${warnings}`
   }
 
   function renderAuctionList() {
+    renderNativeAuctionComparisonIndicators();
     const el = shadow?.querySelector("#ga-auction-list");
     const status = shadow?.querySelector("#ga-auction-status");
     const filter = shadow?.querySelector("#ga-auction-results-filter");
@@ -12604,6 +14281,43 @@ ${warnings}`
     `;
   }
 
+  function ensureNativeOpponentWinRateStyles() {
+    const styleId = "ga-native-opponent-winrate-styles";
+    if (document.getElementById(styleId)) return;
+    const style = document.createElement("style");
+    style.id = styleId;
+    style.textContent = `
+      .ga-native-winrate-host{position:relative!important;overflow:visible!important}
+      .ga-native-winrate-badge{
+        position:absolute!important;display:inline-flex!important;align-items:center!important;gap:4px!important;
+        margin:0!important;padding:0!important;border:0!important;border-radius:0!important;background:transparent!important;
+        pointer-events:none!important;white-space:nowrap!important;z-index:20!important;
+        color:#000!important;font:inherit!important;
+        transform:translateY(-50%)!important;box-shadow:none!important;
+      }
+      .ga-native-winrate-text{color:#000!important}
+      .ga-native-winrate-dot{
+        display:inline-block!important;width:7px!important;height:7px!important;min-width:7px!important;
+        border-radius:50%!important;background:#9ca3af!important;vertical-align:middle!important;
+        box-shadow:none!important;
+      }
+      .ga-native-winrate-dot[data-light="good"]{background:#16a34a!important}
+      .ga-native-winrate-dot[data-light="warn"]{background:#eab308!important}
+      .ga-native-winrate-dot[data-light="bad"],.ga-native-winrate-dot[data-light="error"]{background:#dc2626!important}
+      .ga-native-auction-compare{position:fixed!important;display:inline-flex!important;align-items:center!important;gap:2px!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;background:transparent!important;pointer-events:none!important;white-space:nowrap!important;z-index:100!important;transform:translateY(-50%)!important;box-shadow:none!important;color:#000!important;font:inherit!important}
+      .ga-native-auction-compare-arrow{display:inline-block!important;flex:0 0 10px!important;width:10px!important;height:13px!important;margin:0 1px 0 0!important;background:currentColor!important;clip-path:polygon(50% 0,100% 50%,65% 50%,65% 100%,35% 100%,35% 50%,0 50%)!important;vertical-align:middle!important}
+      .ga-native-auction-compare-arrow.ga-native-auction-compare-arrow-down{clip-path:polygon(35% 0,65% 0,65% 50%,100% 50%,50% 100%,0 50%,35% 50%)!important}
+      .ga-native-auction-compare-arrow.ga-native-auction-compare-arrow-sidegrade{height:10px!important;background:currentColor!important;clip-path:polygon(0 50%,35% 0,35% 35%,65% 35%,65% 0,100% 50%,65% 100%,65% 65%,35% 65%,35% 100%)!important}
+      .ga-native-auction-compare-value{color:#000!important;font:inherit!important;line-height:1!important}
+      .ga-native-equipment-compare{position:fixed!important;display:inline-flex!important;align-items:center!important;gap:2px!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;background:transparent!important;pointer-events:none!important;white-space:nowrap!important;z-index:100!important;transform:translateY(-50%)!important;box-shadow:none!important;color:#000!important;font:inherit!important}
+      .ga-native-equipment-compare-arrow{display:inline-block!important;flex:0 0 10px!important;width:10px!important;height:13px!important;margin:0 1px 0 0!important;background:currentColor!important;clip-path:polygon(50% 0,100% 50%,65% 50%,65% 100%,35% 100%,35% 50%,0 50%)!important;vertical-align:middle!important}
+      .ga-native-equipment-compare-arrow.ga-native-auction-compare-arrow-down{clip-path:polygon(35% 0,65% 0,65% 50%,100% 50%,50% 100%,0 50%,35% 50%)!important}
+      .ga-native-equipment-compare-arrow.ga-native-auction-compare-arrow-sidegrade{height:10px!important;background:currentColor!important;clip-path:polygon(0 50%,35% 0,35% 35%,65% 35%,65% 0,100% 50%,65% 100%,65% 65%,35% 65%,35% 100%)!important}
+      .ga-native-equipment-compare-value{color:#000!important;font:inherit!important;font-weight:700!important;line-height:1!important}
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
   async function createOverlay() {
     if (host) return;
     host = document.createElement("div");
@@ -12617,7 +14331,7 @@ ${warnings}`
       .ga-header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 10px;background:#1f2937;border-radius:11px 11px 0 0;cursor:move;position:sticky;top:0;z-index:5}.ga-title{font-size:14px;font-weight:800}.ga-status{color:#94a3b8;font-size:9px;margin-top:2px}.ga-actions{display:flex;gap:4px}.ga-btn{border:1px solid #475569;background:#374151;color:#e5e7eb;border-radius:6px;min-width:24px;height:24px;cursor:pointer;font-weight:800}.ga-btn:hover{background:#4b5563}.ga-body{padding:10px}.ga-panel.ga-minimized{width:220px;min-width:220px;min-height:0;height:auto;resize:none}.ga-panel.ga-minimized .ga-header{border-radius:11px}
       .ga-tabs{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;margin-bottom:9px;padding:4px;background:#1f2937;border-radius:9px}.ga-tab{border:0;background:transparent;color:#9ca3af;border-radius:7px;padding:7px 6px;cursor:pointer;font-weight:700;font-size:10px}.ga-tab:hover{background:#374151;color:#e5e7eb}.ga-tab.active{background:#d1d5db;color:#111827}.ga-tab-panel{display:none}.ga-tab-panel.active{display:block}
       .ga-card{background:#1f2937;border-radius:10px;padding:10px;margin-top:9px}.ga-card:first-child{margin-top:0}.ga-card-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.ga-card h2{font-size:13px;margin:0 0 7px}.ga-actions-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.ga-secondary,.ga-primary{border:1px solid #475569;border-radius:7px;padding:6px 8px;cursor:pointer;font-weight:700;font-size:10px}.ga-primary{background:#d1d5db;color:#111827}.ga-secondary{background:#374151;color:#e5e7eb}.ga-secondary:hover{background:#4b5563}.ga-muted{color:#94a3b8;font-size:10px}.ga-statusline{margin-bottom:7px;color:#94a3b8;font-size:9px}.ga-character-switcher{display:grid;grid-template-columns:34px minmax(0,1fr) 34px;gap:5px;align-items:center;margin:8px 0}.ga-character-cycle{height:28px;min-width:34px;padding:4px 6px;border:1px solid #475569;border-radius:7px;background:#374151;color:#e5e7eb;cursor:pointer;font-weight:900;font-size:14px;line-height:1}.ga-character-cycle:hover:not(:disabled){background:#4b5563}.ga-character-cycle:disabled{opacity:.4;cursor:default}.ga-character-current{min-width:0;padding:6px 8px;border:1px solid #334155;border-radius:7px;background:#111827;text-align:center;color:#e5e7eb;font-size:10px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      .ga-stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.ga-subsection-title{font-size:12px;margin:10px 0 7px;color:#e5e7eb}.ga-auto-module{border-top:1px solid #374151;padding:8px 0}.ga-auto-module:first-of-type{border-top:0}.ga-auto-module-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.ga-check{display:flex;align-items:center;gap:7px;color:#e5e7eb;font-size:12px}.ga-check input{width:14px;height:14px}.ga-auto-combat-options{display:grid;grid-template-columns:110px 1fr 110px;gap:7px}.ga-auto-combat-options label{display:flex;flex-direction:column;gap:4px;color:#cbd5e1;font-size:10px;font-weight:700}.ga-auto-combat-options select,.ga-auto-combat-options input{width:100%;border:1px solid #475569;border-radius:7px;background:#111827;color:#e5e7eb;padding:6px 7px;font:inherit} .ga-auto-expedition-grid{display:grid;grid-template-columns:1fr 110px;gap:7px;margin-top:8px}.ga-auto-expedition-grid label{display:flex;flex-direction:column;gap:4px;color:#cbd5e1;font-size:10px;font-weight:700}.ga-auto-expedition-grid select,.ga-auto-expedition-grid input{width:100%;border:1px solid #475569;border-radius:7px;background:#111827;color:#e5e7eb;padding:6px 7px;font:inherit}.ga-stat{background:#111827;border-radius:7px;padding:7px 8px;display:flex;justify-content:space-between;gap:8px}.ga-stat strong{font-weight:800}.ga-target:first-child{border-top:0;padding-top:0}.ga-target-title{font-weight:800;margin-bottom:5px}.ga-row{display:flex;justify-content:space-between;gap:8px;font-size:10px;margin:3px 0}.ga-arena-analysis-list{border:1px solid #334155;border-radius:7px;overflow:hidden}.ga-arena-analysis-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:6px 7px;border-top:1px solid #334155;font-size:10px}.ga-arena-analysis-row:first-child{border-top:0}.ga-pill{display:inline-block;padding:2px 5px;background:#374151;border-radius:999px;font-size:8px}.ga-focus:first-child{border-top:0}.ga-focus strong{min-width:82px}.ga-focus span{color:#cbd5e1}
+      .ga-stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.ga-subsection-title{font-size:12px;margin:10px 0 7px;color:#e5e7eb}.ga-auto-module{border-top:1px solid #374151;padding:8px 0}.ga-auto-module:first-of-type{border-top:0}.ga-auto-module-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.ga-check{display:flex;align-items:center;gap:7px;color:#e5e7eb;font-size:12px}.ga-check input{width:14px;height:14px}.ga-auto-combat-options{display:grid;grid-template-columns:110px 1fr 110px;gap:7px}.ga-auto-combat-options label{display:flex;flex-direction:column;gap:4px;color:#cbd5e1;font-size:10px;font-weight:700}.ga-auto-combat-options select,.ga-auto-combat-options input{width:100%;border:1px solid #475569;border-radius:7px;background:#111827;color:#e5e7eb;padding:6px 7px;font:inherit} .ga-auto-expedition-grid{display:grid;grid-template-columns:1fr 110px;gap:7px;margin-top:8px}.ga-auto-expedition-grid label{display:flex;flex-direction:column;gap:4px;color:#cbd5e1;font-size:10px;font-weight:700}.ga-auto-expedition-grid select,.ga-auto-expedition-grid input{width:100%;border:1px solid #475569;border-radius:7px;background:#111827;color:#e5e7eb;padding:6px 7px;font:inherit}.ga-stat{background:#111827;border-radius:7px;padding:7px 8px;display:flex;justify-content:space-between;gap:8px}.ga-stat strong{font-weight:800}.ga-target:first-child{border-top:0;padding-top:0}.ga-target-title{font-weight:800;margin-bottom:5px}.ga-row{display:flex;justify-content:space-between;gap:8px;font-size:10px;margin:3px 0}.ga-arena-analysis-list{border:1px solid #334155;border-radius:7px;overflow:hidden}.ga-arena-analysis-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:6px 7px;border-top:1px solid #334155;font-size:10px}.ga-arena-analysis-row:first-child{border-top:0}.ga-arena-analysis-row small{display:block;margin-top:2px}.ga-pill{display:inline-block;padding:2px 5px;background:#374151;border-radius:999px;font-size:8px}.ga-focus:first-child{border-top:0}.ga-focus strong{min-width:82px}.ga-focus span{color:#cbd5e1}
       ${itemGridCss()}
       .ga-hover-tooltip{position:fixed;z-index:2147483647;width:max-content;min-width:220px;max-width:330px;padding:10px;border:1px solid #64748b;border-radius:9px;background:#0f172a;color:#e5e7eb;box-shadow:0 10px 28px rgba(0,0,0,.55);pointer-events:none;font-size:10px;line-height:1.2}.ga-hover-head{display:flex;align-items:center;gap:8px;min-width:0}.ga-hover-icon{width:54px;height:54px;flex:0 0 54px;object-fit:contain;background:#111827;border:1px solid #475569;border-radius:6px}.ga-hover-icon.ga-missing{display:flex;align-items:center;justify-content:center;color:#64748b}.ga-hover-title{min-width:0;flex:1}.ga-hover-name{font-size:12px;line-height:1.2;font-weight:900;overflow-wrap:anywhere}.ga-hover-meta{color:#94a3b8;font-size:9px;margin-top:3px}.ga-hover-section{margin-top:9px}.ga-hover-section-title{color:#94a3b8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}.ga-hover-stats{display:flex;flex-wrap:wrap;gap:4px}.ga-hover-stat{background:#1f2937;border:1px solid #334155;border-radius:5px;padding:3px 5px;font-size:9px}.ga-hover-muted{color:#64748b;font-size:9px}.ga-hover-stat-table{display:grid;grid-template-columns:minmax(0,1fr) 56px;border:1px solid #334155;border-radius:5px;overflow:hidden;background:#1f2937}.ga-hover-stat-table-header,.ga-hover-stat-table-row{display:contents}.ga-hover-stat-table-header>span{color:#94a3b8;font-size:8px;font-weight:800;padding:3px 5px;background:#172033;border-bottom:1px solid #334155}.ga-hover-stat-table-header>span:last-child{text-align:right}.ga-hover-stat-table-row>span{min-width:0;padding:3px 5px;font-size:9px;border-bottom:1px solid #273447}.ga-hover-stat-table-row:last-child>span{border-bottom:0}.ga-hover-stat-table-row>span:last-child{text-align:right;color:#cbd5e1;white-space:nowrap}.ga-hover-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:9px}.ga-hover-grid>div{display:flex;justify-content:space-between;gap:7px;padding:4px 5px;background:#1f2937;border-radius:5px;font-size:9px}.ga-hover-grid strong{color:#f3f4f6}.ga-tier{display:inline-flex;align-items:center;justify-content:center;min-width:24px;padding:2px 5px;border:1px solid currentColor;border-radius:5px;font-size:10px;font-weight:900}.ga-missing{color:#64748b}
       .ga-combat-result{display:inline-flex;align-items:center;justify-content:center;padding:4px 7px;border-radius:999px;border:1px solid #475569;background:#111827;color:#cbd5e1;font-size:9px;font-weight:800}.ga-combat-result.win,.ga-combat-history-result.win{color:#86efac;border-color:#166534}.ga-combat-result.loss,.ga-combat-history-result.loss{color:#fca5a5;border-color:#7f1d1d}.ga-combat-result.unknown,.ga-combat-history-result.unknown{color:#cbd5e1}.ga-combat-history{display:flex;flex-direction:column;margin-top:7px;border-top:1px solid #374151}.ga-combat-history-head,.ga-combat-history-row{display:grid;grid-template-columns:minmax(0,1fr) 64px 118px;gap:8px;align-items:center}.ga-combat-history-head{padding:5px 7px;color:#94a3b8;font-size:8px}.ga-combat-history-row{width:100%;border:0;border-top:1px solid #273447;background:transparent;color:#e5e7eb;padding:7px;cursor:pointer;text-align:left}.ga-combat-history-row:hover{background:#172033}.ga-combat-history-main{min-width:0;display:flex;flex-direction:column;gap:2px}.ga-combat-history-main strong{font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ga-combat-history-main small{font-size:8px;color:#94a3b8}.ga-combat-history-result{font-size:8px;font-weight:800}.ga-combat-history-values{display:grid;grid-template-columns:1fr 1fr;gap:4px;text-align:right;font-size:9px}.ga-combat-history-values span:first-child::before{content:"↑ ";color:#94a3b8}.ga-combat-history-values span:last-child::before{content:"↓ ";color:#94a3b8}.ga-combat-history-detail{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:7px;font-size:8px;line-height:1.35;color:#94a3b8;background:#0f172a;border-radius:7px;padding:8px;max-height:360px;overflow:auto}.ga-combat-metrics-grid{grid-template-columns:repeat(3,1fr)}.ga-combat-filters{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:8px}.ga-combat-filters label{display:flex;flex-direction:column;gap:4px}.ga-combat-filters label span{font-size:8px;color:#94a3b8}.ga-combat-filters select{width:100%}.ga-combat-trend-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:8px}.ga-combat-trend-grid .ga-stat small{display:block;margin-top:4px;font-size:8px;color:#64748b}.ga-combat-delta{font-weight:700}.ga-combat-delta.up{color:#86efac}.ga-combat-delta.down{color:#fca5a5}.ga-combat-delta.same{color:#cbd5e1}
@@ -12743,7 +14457,7 @@ ${warnings}`
         <section class="ga-tab-panel${activeTab === "settings" ? " active" : ""}" data-panel="settings">
           <section class="ga-card"><h2>Global simulation</h2><div class="ga-field-grid"><label class="ga-field"><span>Simulations</span><input data-setting="simulationCount" type="number" min="1" max="10000" step="1"></label></div><div class="ga-muted" style="margin-top:5px">This single value is used for Stat Priority analysis, Arena opponent analysis, Circus Provinciarum opponent analysis, and Auction House item-comparison calculations. Lower values finish faster but produce noisier Monte Carlo estimates.</div></section>
           <section class="ga-card"><h2>Character stats</h2><div class="ga-field-grid" id="ga-settings-stats"></div></section>
-          <section class="ga-card"><h2>Auto Combat</h2><div class="ga-field-grid" id="ga-settings-automation"><label class="ga-field"><span>Pre-action delay minimum (ms)</span><input data-auto-setting="preActionDelayMinMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Pre-action delay maximum (ms)</span><input data-auto-setting="preActionDelayMaxMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Minimum HP threshold (%)</span><input data-auto-setting="minimumHpThresholdPercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Healing inventory</span><select data-auto-setting="healingBagNumber"></select></label><label class="ga-field"><span>Post-battle loot search</span><select data-auto-setting="postBattleLootAction"><option value="thorough">Thorough Search</option><option value="quick">Quick Search</option><option value="return">Return to Safety</option></select></label><label class="ga-field"><span>Healing behavior</span><span style="display:flex;align-items:center;gap:7px"><input data-auto-setting="avoidHealingOverheal" type="checkbox"><span>Avoid overheal</span></span></label></div><div class="ga-muted" style="margin-top:5px">A fresh random integer delay is applied immediately before every automated Arena, Circus Provinciarum or Expedition click. When the optional post-battle loot screen appears after an Expedition or Dungeon battle, Auto Combat performs the selected action. When it does not appear, automation continues normally. When HP falls below the single configured threshold, Auto Combat pauses and automatically heals the main character from the selected in-game inventory page. When Avoid overheal is enabled, only healing combinations at or below the missing HP are allowed; if no zero-overheal combination exists, Auto Combat stops instead of wasting HP. Healing uses the selected in-game inventory page; the internal bag number is handled automatically.</div></section>
+          <section class="ga-card"><h2>Auto Combat</h2><div class="ga-field-grid" id="ga-settings-automation"><label class="ga-field"><span>Pre-action delay minimum (ms)</span><input data-auto-setting="preActionDelayMinMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Pre-action delay maximum (ms)</span><input data-auto-setting="preActionDelayMaxMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Minimum HP threshold (%)</span><input data-auto-setting="minimumHpThresholdPercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Minimum opponent win rate (%)</span><input data-auto-setting="minimumOpponentWinRatePercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Healing inventory</span><select data-auto-setting="healingBagNumber"></select></label><label class="ga-field"><span>Post-battle loot search</span><select data-auto-setting="postBattleLootAction"><option value="thorough">Thorough Search</option><option value="quick">Quick Search</option><option value="return">Return to Safety</option></select></label><label class="ga-field"><span>Healing behavior</span><span style="display:flex;align-items:center;gap:7px"><input data-auto-setting="avoidHealingOverheal" type="checkbox"><span>Avoid overheal</span></span></label></div><div class="ga-muted" style="margin-top:5px">A fresh random integer delay is applied immediately before every automated Arena, Circus Provinciarum or Expedition click. When the optional post-battle loot screen appears after an Expedition or Dungeon battle, Auto Combat performs the selected action. When it does not appear, automation continues normally. When HP falls below the single configured threshold, Auto Combat pauses and automatically heals the main character from the selected in-game inventory page. When Avoid overheal is enabled, only healing combinations at or below the missing HP are allowed; if no zero-overheal combination exists, Auto Combat stops instead of wasting HP. When Minimum opponent win rate is above 0%, Auto Arena and Auto Circus request a fresh opponent set instead of fighting when every currently unattempted opponent is below that threshold. A value of 0 disables this safeguard. Healing uses the selected in-game inventory page; the internal bag number is handled automatically.</div></section>
           <section class="ga-settings-save"><span class="ga-settings-status" id="ga-settings-status"></span><button class="ga-primary" id="ga-save-settings" type="button">Save settings</button></section>
         </section>
       </div>
@@ -12838,6 +14552,10 @@ ${warnings}`
     makeDraggable();
     applyPosition();
     document.documentElement.appendChild(host);
+    ensureNativeOpponentWinRateStyles();
+    initializeNativeOpponentWinRateDisplay();
+    initializeNativeAuctionComparisonDisplay();
+    initializeNativeEquipmentComparisonDisplay();
     switchTab(activeTab);
     applyMinimized();
     applySize();
@@ -12860,11 +14578,16 @@ ${warnings}`
     await loadCircusCombatStore();
     await loadDungeonCombatStore();
     await loadCircusProvinciarumAnalysisStore();
+    renderNativeOpponentWinRateBadges();
+    nativeOpponentWinRateAutoAnalysisReady = true;
+    scheduleNativeOpponentWinRateAutoAnalysis();
     await loadSimulatorState();
     await loadStatPriorityDiagnostics();
     await loadStatPriorityState();
     invalidateAuctionComparisons("page-load-state-reset");
     await loadAuctionComparisonResults();
+    initializeNativeEquipmentComparisonDisplay();
+    scheduleNativeEquipmentComparisonScan(40);
     renderAuctionList();
     await loadAutoExpeditionState();
     await loadArenaAutomationState();
@@ -12908,7 +14631,10 @@ ${warnings}`
   api.storage.onChanged?.addListener((changes, area) => {
     if (area !== "local") return;
     const eqKey = equipmentKey();
-    if (changes[eqKey]) loadSavedEquipment();
+    if (changes[eqKey]) {
+      loadSavedEquipment();
+      scheduleNativeEquipmentComparisonScan(120);
+    }
     if (changes[auctionKey()]) void loadSavedAuction({ invalidate: false, invalidationReason: "auction-store-storage-change" });
     if (changes[auctionDiagnosticKey()]) { latestAuctionDiagnostic = changes[auctionDiagnosticKey()].newValue || null; }
     if (changes[diagnosticKey()]) { latestEquipmentDiagnostic = changes[diagnosticKey()].newValue || null; }
@@ -12945,6 +14671,7 @@ ${warnings}`
     }
     if (changes[arenaOpponentAnalysisKey()]) {
       arenaOpponentAnalysisStore = changes[arenaOpponentAnalysisKey()].newValue || { schemaVersion: 2, updatedAt: null, setSignature: null, playerProfile: null, opponents: {} };
+      renderNativeOpponentWinRateBadges();
       if (host) renderAutoCombatUI();
     }
     if (changes[circusCombatKey()]) {
@@ -12953,6 +14680,7 @@ ${warnings}`
     }
     if (changes[circusProvinciarumAnalysisKey()]) {
       circusProvinciarumAnalysisStore = changes[circusProvinciarumAnalysisKey()].newValue || { schemaVersion: 1, updatedAt: null, setSignature: null, playerProfile: null, opponents: {} };
+      renderNativeOpponentWinRateBadges();
       if (host) renderAutoCombatUI();
     }
     if (changes[statPriorityStateKey()]) {
@@ -13001,6 +14729,7 @@ ${warnings}`
     if (changes.settings) {
       settings = normalizeSettings(changes.settings.newValue || defaultSettings());
       renderSettings(); renderStats(); renderDiagnosticCaptureControls();
+      renderNativeOpponentWinRateBadges();
     }
     if (changes[overlayStateKey()]) {
       overlayState = { ...overlayState, ...(changes[overlayStateKey()].newValue || {}) };

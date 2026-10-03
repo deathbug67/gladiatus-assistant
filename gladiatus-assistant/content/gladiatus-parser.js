@@ -290,17 +290,26 @@
 
   function isItemElement(el) {
     if (!el?.classList) return false;
-    return [...el.classList].some(c => /^item-i-\d+-\d+$/i.test(c)) && !!el.getAttribute?.('data-item-id');
+    return [...el.classList].some(c => /^item-i-\d+-\d+$/i.test(c)) && (!!el.getAttribute?.('data-item-id') || !!el.getAttribute?.('data-hash'));
   }
 
   function findActualItemElement(node, slotElement) {
     if (isItemElement(node)) return node;
+
+    // Tooltip-bearing wrappers frequently contain the real .item-i-* element
+    // as a descendant. The previous implementation only searched upward from
+    // the tooltip node (and the optional equipment slot), so inventory/reward
+    // wrappers were silently rejected before simulation could be queued.
+    const descendant = node?.querySelector?.('[class*="item-i-"][data-item-id], [class*="item-i-"][data-hash]');
+    if (isItemElement(descendant)) return descendant;
+
     let el = node;
     for (let i = 0; el && i < 8; i++, el = el.parentElement) {
       if (isItemElement(el)) return el;
     }
-    const descendant = slotElement?.querySelector?.('[class*="item-i-"][data-item-id]');
-    return isItemElement(descendant) ? descendant : null;
+
+    const slotDescendant = slotElement?.querySelector?.('[class*="item-i-"][data-item-id], [class*="item-i-"][data-hash]');
+    return isItemElement(slotDescendant) ? slotDescendant : null;
   }
 
   function findEquipmentContainer(itemElement, root) {
@@ -355,6 +364,21 @@
       for (const a of attrs) {
         const v = n.getAttribute?.(a);
         if (v) return v;
+      }
+    }
+    return null;
+  }
+
+  const GENERIC_ITEM_IDENTITY_ATTRS = Object.freeze([
+    "data-content-type", "data-item-type", "data-category", "data-type"
+  ]);
+
+  function attributeItemContentType(node, itemElement = null) {
+    const nodes = [itemElement, node].filter(Boolean);
+    for (const n of nodes) {
+      for (const a of GENERIC_ITEM_IDENTITY_ATTRS) {
+        const v = n.getAttribute?.(a);
+        if (v != null && String(v).trim() !== "") return String(v).trim();
       }
     }
     return null;
@@ -640,6 +664,7 @@
       itemDomClass: candidate.itemElement?.className || null,
       itemId: attributeItemId(candidate.itemElement, candidate.node),
       itemHash: attributeItemHash(candidate.slotElement, candidate.node, candidate.itemElement),
+      contentType: attributeItemContentType(candidate.node, candidate.itemElement),
       name: candidate.itemName,
       quality: q.quality,
       nameColor: q.nameColor,
@@ -676,6 +701,392 @@
     item.displayDamage = damageDisplay(item.raw.damage);
     item.fitTier = provisionalTier(item);
     return item;
+  }
+
+  const GENERIC_NON_EQUIPMENT_CONTENT_TYPES = new Set(["-1", "64"]);
+
+  function genericItemSourceKey(node) {
+    const parts = [
+      node?.closest?.("#packages, #inventory, #inv, .inventory_box, .packageItem, #content, #center, body")?.id || "",
+      node?.getAttribute?.("data-container-number") || "",
+      node?.getAttribute?.("data-position-x") || "",
+      node?.getAttribute?.("data-position-y") || "",
+      node?.getAttribute?.("data-item-id") || "",
+      node?.getAttribute?.("data-hash") || ""
+    ];
+    return parts.join("|");
+  }
+
+  function genericCandidateVisible(node) {
+    const rect = visibleRect(node);
+    if (!rect) return false;
+    const right = rect.left + rect.width;
+    const bottom = rect.top + rect.height;
+    return bottom > 0 && rect.top < window.innerHeight && right > 0 && rect.left < window.innerWidth;
+  }
+
+  function genericDiagnosticElementSnapshot(node) {
+    if (!node) return null;
+    const attrs = {};
+    for (const name of ["id", "class", "data-item-id", "data-hash", "data-content-type", "data-item-type", "data-category", "data-type", "data-container-number", "data-position-x", "data-position-y", "data-measurement-x", "data-measurement-y"]) {
+      const value = node.getAttribute?.(name);
+      if (value != null && value !== "") attrs[name] = String(value).slice(0, 500);
+    }
+    return {
+      tag: String(node.tagName || "").toLowerCase() || null,
+      attrs,
+      text: normalize(node.textContent || "").slice(0, 180),
+      hasTooltip: node.hasAttribute?.("data-tooltip") || false,
+      tooltipLength: String(node.getAttribute?.("data-tooltip") || "").length
+    };
+  }
+
+  function genericItemCandidateElements() {
+    // Keep the exact rejection path visible in the master diagnostic. This is
+    // deliberately one structured capture result rather than a separate
+    // diagnostic collector so the problem can be diagnosed from Copy master
+    // diagnostic alone.
+    const allTooltipNodes = Array.from(document.querySelectorAll('[data-tooltip]'));
+    const directItemNodes = Array.from(document.querySelectorAll('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]'));
+    const diagnostic = {
+      schemaVersion: 1,
+      capturedAt: new Date().toISOString(),
+      queryCounts: {
+        tooltipNodes: allTooltipNodes.length,
+        directItemNodes: directItemNodes.length
+      },
+      stages: {
+        tooltipNodesExamined: 0,
+        excludedByContainer: 0,
+        actualItemResolved: 0,
+        actualItemNotResolved: 0,
+        excludedResolvedItemByContainer: 0
+      },
+      candidateChecks: [],
+      directItemNodeSamples: directItemNodes.slice(0, 60).map(genericDiagnosticElementSnapshot)
+    };
+    const seen = new Set();
+    const out = [];
+    const pushCheck = check => {
+      if (diagnostic.candidateChecks.length < 100) diagnostic.candidateChecks.push(check);
+    };
+    for (const node of allTooltipNodes) {
+      diagnostic.stages.tooltipNodesExamined += 1;
+      const check = {
+        tooltipNode: genericDiagnosticElementSnapshot(node),
+        result: null,
+        itemElement: null,
+        parsed: null
+      };
+      if (seen.has(node)) {
+        check.result = "duplicate-tooltip-node";
+        pushCheck(check);
+        continue;
+      }
+      seen.add(node);
+      const sourceContainer = node.closest?.("#char, .auction_item_div, .ga-host, #gladiatus-assistant");
+      if (sourceContainer) {
+        diagnostic.stages.excludedByContainer += 1;
+        check.result = "excluded-by-container";
+        check.excludedContainer = genericDiagnosticElementSnapshot(sourceContainer);
+        pushCheck(check);
+        continue;
+      }
+      const itemElement = findActualItemElement(node, null);
+      if (!itemElement) {
+        diagnostic.stages.actualItemNotResolved += 1;
+        check.result = "actual-item-not-resolved";
+        pushCheck(check);
+        continue;
+      }
+      diagnostic.stages.actualItemResolved += 1;
+      check.itemElement = genericDiagnosticElementSnapshot(itemElement);
+      const itemContainer = itemElement.closest?.("#char, .auction_item_div, .ga-host, #gladiatus-assistant");
+      if (itemContainer) {
+        diagnostic.stages.excludedResolvedItemByContainer += 1;
+        check.result = "resolved-item-excluded-by-container";
+        check.excludedContainer = genericDiagnosticElementSnapshot(itemContainer);
+        pushCheck(check);
+        continue;
+      }
+      check.result = "resolved";
+      pushCheck(check);
+      out.push(node);
+    }
+    diagnostic.visibleDirectItemNodes = directItemNodes.filter(node => genericCandidateVisible(node)).length;
+    diagnostic.visibleDirectItemNodeSamples = directItemNodes.filter(node => genericCandidateVisible(node)).slice(0, 60).map(genericDiagnosticElementSnapshot);
+    return { nodes: out, diagnostic };
+  }
+
+  function genericEquipmentTypeMapFromCurrentDoll() {
+    const map = {};
+    const root = document.querySelector("#char");
+    if (!root) return map;
+    const found = directTooltipCandidates(root);
+    const assignments = assignSlots(found.accepted, root);
+    for (const assignment of assignments) {
+      const candidate = assignment.candidate;
+      const type = attributeItemContentType(candidate.node, candidate.itemElement);
+      if (!type) continue;
+      const key = String(type);
+      if (!map[key]) map[key] = [];
+      if (!map[key].includes(assignment.slot)) map[key].push(assignment.slot);
+    }
+    return map;
+  }
+
+  function mergeGenericTypeMaps(...maps) {
+    const out = {};
+    for (const map of maps) {
+      for (const [type, slots] of Object.entries(map || {})) {
+        if (!Array.isArray(slots) || !slots.length) continue;
+        if (!out[type]) out[type] = [];
+        for (const slot of slots) if (!out[type].includes(slot)) out[type].push(slot);
+      }
+    }
+    return out;
+  }
+
+  const GENERIC_ITEM_CLASS_GROUP_TO_SLOT = Object.freeze({
+    "1": "weapon",
+    "2": "shield",
+    "3": "chest",
+    "4": "helmet",
+    "5": "gloves",
+    "6": "ring",
+    "8": "boots",
+    "9": "amulet"
+  });
+
+  function genericComparisonSlotsForCandidate(candidate, typeMap) {
+    const type = String(candidate?.contentType || "").trim();
+    const mapped = Array.isArray(typeMap?.[type]) ? typeMap[type].filter(Boolean) : [];
+    if (mapped.length) {
+      if (mapped.every(slot => /^ring[12]$/.test(slot))) return ["ring1", "ring2"];
+      return [...new Set(mapped)];
+    }
+
+    // Inventory/reward item elements use the same stable item-i-GROUP-VARIANT
+    // class family as the character equipment DOM. The first numeric component
+    // identifies the equipment family; use it only as a fallback after the
+    // stronger content-type mapping above. Ring items intentionally map to both
+    // ring slots because simulateAuctionComparison() evaluates both and keeps
+    // the better replacement result.
+    const classNames = [
+      candidate?.itemElement?.className,
+      candidate?.node?.className,
+      candidate?.itemDomClass,
+      candidate?.parsedItemClass
+    ].filter(value => typeof value === "string");
+    for (const className of classNames) {
+      const match = className.match(/(?:^|\s)item-i-(\d+)-\d+(?:\s|$)/i);
+      const family = match?.[1] || null;
+      const slot = GENERIC_ITEM_CLASS_GROUP_TO_SLOT[family];
+      if (!slot) continue;
+      if (slot === "ring") return ["ring1", "ring2"];
+      return [slot];
+    }
+    return [];
+  }
+
+  function directVisibleEquipmentCandidates() {
+    const typeMap = mergeGenericTypeMaps(genericEquipmentTypeMapFromCurrentDoll());
+    const candidateResult = genericItemCandidateElements();
+    const nodes = candidateResult.nodes;
+    const diagnostic = candidateResult.diagnostic;
+    diagnostic.typeMap = typeMap;
+    diagnostic.typeMapKeys = Object.keys(typeMap);
+    diagnostic.scanCandidates = {
+      visibleTooltipNodes: 0,
+      tooltipRowsParsed: 0,
+      tooltipRowsRejected: 0,
+      itemNamesFound: 0,
+      itemNamesMissing: 0,
+      nonEquipmentRejected: 0,
+      itemIdsFound: 0,
+      itemIdsMissing: 0,
+      itemHashesFound: 0,
+      itemHashesMissing: 0,
+      duplicateIdentityRejected: 0,
+      comparisonSlotsResolved: 0,
+      comparisonSlotsMissing: 0,
+      accepted: 0
+    };
+    diagnostic.acceptedItems = [];
+    diagnostic.rejectedItems = [];
+    const accepted = [];
+    const seenIdentity = new Set();
+    const pushRejected = (reason, node, itemElement, extra = {}) => {
+      if (diagnostic.rejectedItems.length >= 100) return;
+      diagnostic.rejectedItems.push({
+        reason,
+        tooltipNode: genericDiagnosticElementSnapshot(node),
+        itemElement: genericDiagnosticElementSnapshot(itemElement),
+        ...extra
+      });
+    };
+    for (const node of nodes) {
+      if (!genericCandidateVisible(node)) {
+        pushRejected("tooltip-node-not-visible", node, null);
+        continue;
+      }
+      diagnostic.scanCandidates.visibleTooltipNodes += 1;
+      const tooltip = getTooltipAttr(node);
+      const rows = tooltipRows(tooltip);
+      const itemLike = rows.length > 0 && itemLikeRows(rows);
+      if (!rows.length || !itemLike) {
+        diagnostic.scanCandidates.tooltipRowsRejected += 1;
+        pushRejected("tooltip-rows-not-item-like", node, null, {
+          tooltipLength: String(tooltip || "").length,
+          rowCount: rows.length,
+          itemLikeRows: itemLike
+        });
+        continue;
+      }
+      diagnostic.scanCandidates.tooltipRowsParsed += 1;
+      const itemName = findItemName(rows);
+      if (!itemName || itemName === "Unknown item") {
+        diagnostic.scanCandidates.itemNamesMissing += 1;
+        pushRejected("item-name-missing", node, null, { rowCount: rows.length });
+        continue;
+      }
+      diagnostic.scanCandidates.itemNamesFound += 1;
+      const itemElement = findActualItemElement(node, null) || node;
+      const contentType = attributeItemContentType(node, itemElement);
+      if (contentType && GENERIC_NON_EQUIPMENT_CONTENT_TYPES.has(String(contentType))) {
+        diagnostic.scanCandidates.nonEquipmentRejected += 1;
+        pushRejected("non-equipment-content-type", node, itemElement, { contentType, itemName });
+        continue;
+      }
+      const itemId = attributeItemId(itemElement, node);
+      const itemHash = attributeItemHash(null, node, itemElement);
+      if (!itemId && !itemHash) {
+        diagnostic.scanCandidates.itemIdsMissing += 1;
+        diagnostic.scanCandidates.itemHashesMissing += 1;
+        pushRejected("item-identity-missing", node, itemElement, { itemName, contentType });
+        continue;
+      }
+      if (itemId) diagnostic.scanCandidates.itemIdsFound += 1;
+      if (itemHash) diagnostic.scanCandidates.itemHashesFound += 1;
+      const identity = genericItemSourceKey(itemElement);
+      if (seenIdentity.has(identity)) {
+        diagnostic.scanCandidates.duplicateIdentityRejected += 1;
+        pushRejected("duplicate-identity", node, itemElement, { itemId, itemName, identity });
+        continue;
+      }
+      seenIdentity.add(identity);
+      const candidate = {
+        node, tooltip, rows, itemName, itemElement, slotElement: null, equipmentContainer: null,
+        containerNumber: null, slotDomId: "",
+        iconInfo: iconInfoFromSlot(null, node, itemElement),
+        itemId,
+        itemHash: attributeItemHash(null, node, itemElement),
+        contentType,
+        measurementX: Number(itemElement.getAttribute("data-measurement-x") || 0) || null,
+        measurementY: Number(itemElement.getAttribute("data-measurement-y") || 0) || null,
+        positionX: Number(itemElement.getAttribute("data-position-x") || 0) || null,
+        positionY: Number(itemElement.getAttribute("data-position-y") || 0) || null,
+        sourceKey: identity,
+        source: "generic-visible"
+      };
+      const item = parseTooltipItem(candidate, null);
+      item.contentType = contentType;
+      item.measurementX = candidate.measurementX;
+      item.measurementY = candidate.measurementY;
+      item.positionX = candidate.positionX;
+      item.positionY = candidate.positionY;
+      item.sourceKey = candidate.sourceKey;
+      item.source = candidate.source;
+      item.comparisonSlots = genericComparisonSlotsForCandidate(item, typeMap);
+      if (!item.comparisonSlots.length) {
+        diagnostic.scanCandidates.comparisonSlotsMissing += 1;
+        pushRejected("comparison-slot-unresolved", node, itemElement, {
+          itemId,
+          itemName,
+          contentType,
+          itemClass: itemElement.className || null,
+          typeMap,
+          parsedItemClass: item.itemDomClass || null
+        });
+        continue;
+      }
+      diagnostic.scanCandidates.comparisonSlotsResolved += 1;
+      diagnostic.scanCandidates.accepted += 1;
+      accepted.push({ item, sourceKey: candidate.sourceKey, contentType, comparisonSlots: item.comparisonSlots });
+      if (diagnostic.acceptedItems.length < 100) {
+        diagnostic.acceptedItems.push({
+          itemId: item.itemId,
+          itemHash: item.itemHash,
+          itemName: item.name,
+          contentType: item.contentType,
+          comparisonSlots: item.comparisonSlots,
+          itemClass: item.itemDomClass,
+          sourceKey: item.sourceKey,
+          measurementX: item.measurementX,
+          measurementY: item.measurementY,
+          positionX: item.positionX,
+          positionY: item.positionY,
+          tooltipNode: genericDiagnosticElementSnapshot(node),
+          itemElement: genericDiagnosticElementSnapshot(itemElement)
+        });
+      }
+    }
+    diagnostic.final = {
+      accepted: accepted.length,
+      examinedTooltipCandidates: nodes.length,
+      directItemNodes: diagnostic.queryCounts.directItemNodes,
+      visibleDirectItemNodes: diagnostic.visibleDirectItemNodes
+    };
+    return { accepted, typeMap, examined: nodes.length, diagnostic };
+  }
+
+  function directAuctionComparisonCandidates() {
+    const category = auctionCategoryInfo();
+    const allListings = Array.from(document.querySelectorAll('.auction_item_div'));
+    const accepted = [];
+    for (let globalIndex = 0; globalIndex < allListings.length; globalIndex++) {
+      const listing = allListings[globalIndex];
+      const itemElement = findAuctionItemElement(listing);
+      if (!itemElement) continue;
+      const tooltip = getTooltipAttr(itemElement);
+      const groups = auctionTooltipGroups(tooltip);
+      if (!groups.first?.length) continue;
+      const rows = auctionFirstGroupRows(tooltip);
+      const itemName = findItemName(rows);
+      if (!itemName || itemName === 'Unknown item') continue;
+      const candidate = {
+        listing, itemElement, node: itemElement, tooltip, rows, itemName,
+        index: globalIndex, globalIndex, iconInfo: iconInfoFromSlot(null, listing, itemElement),
+        auctionPrice: auctionPriceFromElement(itemElement),
+        measurementX: Number(itemElement.getAttribute('data-measurement-x') || 0) || null,
+        measurementY: Number(itemElement.getAttribute('data-measurement-y') || 0) || null,
+        itemLevel: Number(itemElement.getAttribute('data-level') || 0) || null,
+        itemHash: itemElement.getAttribute('data-hash') || null,
+        itemId: itemElement.getAttribute('data-item-id') || null,
+        contentType: attributeItemContentType(itemElement, itemElement),
+        listingClass: listing.className || null
+      };
+      const item = parseAuctionItem(candidate, globalIndex);
+      accepted.push(item);
+    }
+    return { accepted, typeMap: {}, examined: allListings.length, categoryValue: category.value, categoryLabel: category.label };
+  }
+
+  async function scanVisibleEquipmentForComparison() {
+    const auction = directAuctionComparisonCandidates();
+    const generic = directVisibleEquipmentCandidates();
+    const items = [...auction.accepted, ...generic.accepted.map(entry => entry.item)];
+    return {
+      ok: true, items, auctionCount: auction.accepted.length, genericCount: generic.accepted.length,
+      typeMap: generic.typeMap, examined: auction.examined + generic.examined,
+      categoryValue: auction.categoryValue || null, categoryLabel: auction.categoryLabel || null,
+      captureDiagnostics: {
+        mode: "visible-equipment-comparison",
+        page: { url: location.href, pathname: location.pathname, hostname: location.hostname, bodyId: document.body?.id || "" },
+        auction: { examined: auction.examined, accepted: auction.accepted.length, categoryValue: auction.categoryValue || null, categoryLabel: auction.categoryLabel || null },
+        generic: generic.diagnostic
+      }
+    };
   }
 
   function quickEquipmentSignature(root) {
@@ -1503,6 +1914,7 @@
     if (message?.type === "CAPTURE_CHARACTER_PROFILE") return await captureCharacterProfile();
     if (message?.type === "SCAN_EQUIPMENT") return await scanEquipment();
     if (message?.type === "SCAN_AUCTION") return await scanAuction();
+    if (message?.type === "SCAN_VISIBLE_EQUIPMENT_COMPARISON") return await scanVisibleEquipmentForComparison();
     if (message?.type === "QUICK_EQUIPMENT") {
       const root = document.querySelector("#char");
       return { rootFound: !!root, quickSignature: root ? quickEquipmentSignature(root) : null };
@@ -1512,7 +1924,7 @@
 
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const type = message?.type;
-    if (!["PING", "DISCOVER_CHARACTER_DOLLS", "CAPTURE_CHARACTER_PROFILE", "SCAN_EQUIPMENT", "SCAN_AUCTION", "QUICK_EQUIPMENT"].includes(type)) return false;
+    if (!["PING", "DISCOVER_CHARACTER_DOLLS", "CAPTURE_CHARACTER_PROFILE", "SCAN_EQUIPMENT", "SCAN_AUCTION", "SCAN_VISIBLE_EQUIPMENT_COMPARISON", "QUICK_EQUIPMENT"].includes(type)) return false;
     Promise.resolve(handle(message)).then(sendResponse).catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   });
