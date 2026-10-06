@@ -273,6 +273,8 @@
     baseArmour = null,
     baseLifeMax = null,
     recalculateDerived = false,
+    dinoPoints = null,
+    dinoPointItemBonuses = null,
     name = null
   } = {}) {
     const equipment = equipmentSnapshot?.equipment || equipmentSnapshot || {};
@@ -393,6 +395,36 @@
       ? numberOrNull(stats.healing)
       : finite(itemData.totals.healing.flat);
 
+    const authoritativeDinoPoints = (dinoPoints && typeof dinoPoints === "object") ? dinoPoints : stats?.dinoPoints;
+    const resolvedDinoPoints = authoritativeDinoPoints && ["avoidCritical", "block", "critical"].every(key => Number.isFinite(Number(authoritativeDinoPoints[key])))
+      ? {
+          avoidCritical: Math.max(0, finite(authoritativeDinoPoints.avoidCritical)),
+          block: Math.max(0, finite(authoritativeDinoPoints.block)),
+          critical: Math.max(0, finite(authoritativeDinoPoints.critical))
+        }
+      : {
+          avoidCritical: Math.max(0, Math.floor(finite(derived.agility) / 10) + finite(itemData.totals.hardening?.flat)),
+          block: Math.max(0, Math.floor(finite(derived.strength) / 10) + finite(itemData.totals.blockValue?.flat)),
+          critical: Math.max(0, Math.floor(finite(derived.dexterity) / 10) + finite(itemData.totals.criticalAttack?.flat))
+        };
+    const resolvedDinoPointItemBonuses = (dinoPointItemBonuses && typeof dinoPointItemBonuses === "object")
+      ? {
+          avoidCritical: Math.max(0, finite(dinoPointItemBonuses.avoidCritical)),
+          block: Math.max(0, finite(dinoPointItemBonuses.block)),
+          critical: Math.max(0, finite(dinoPointItemBonuses.critical))
+        }
+      : (stats?.dinoPointItemBonuses && typeof stats.dinoPointItemBonuses === "object")
+        ? {
+            avoidCritical: Math.max(0, finite(stats.dinoPointItemBonuses.avoidCritical)),
+            block: Math.max(0, finite(stats.dinoPointItemBonuses.block)),
+            critical: Math.max(0, finite(stats.dinoPointItemBonuses.critical))
+          }
+        : {
+            avoidCritical: Math.max(0, finite(itemData.totals.hardening?.flat)),
+            block: Math.max(0, finite(itemData.totals.blockValue?.flat)),
+            critical: Math.max(0, finite(itemData.totals.criticalAttack?.flat))
+          };
+
     return {
       modelVersion: MODEL_VERSION,
       formulaVersion: MODEL_VERSION,
@@ -418,11 +450,9 @@
       equipment: itemData.slots,
       itemModifiers: itemData.totals,
       itemCount: itemData.itemCount,
-      dinoPoints: {
-        avoidCritical: Math.max(0, Math.floor(finite(derived.agility) / 10) + finite(itemData.totals.hardening?.flat)),
-        block: Math.max(0, Math.floor(finite(derived.strength) / 10) + finite(itemData.totals.blockValue?.flat)),
-        critical: Math.max(0, Math.floor(finite(derived.dexterity) / 10) + finite(itemData.totals.criticalAttack?.flat))
-      },
+      dinoPoints: resolvedDinoPoints,
+      dinoPointItemBonuses: resolvedDinoPointItemBonuses,
+      dinoPointSource: authoritativeDinoPoints ? "authoritative-profile" : "item-modifier-fallback",
       buffs: {
         minerva: !!stats?.buffs?.minerva,
         mars: !!stats?.buffs?.mars,
@@ -473,10 +503,11 @@
     next.criticalChance = calculateCriticalChance(next.level, next.dexterity, itemMods.criticalAttack?.flat || 0);
     next.blockChance = calculateBlockChance(next.level, next.strength, itemMods.blockValue?.flat || 0, numberOrNull(enemy.level) ?? 0);
     next.criticalAvoidance = calculateAvoidCritChance(next.level, next.agility, itemMods.hardening?.flat || 0);
+    const pointBonuses = next.dinoPointItemBonuses || {};
     next.dinoPoints = {
-      critical: Math.max(0, Math.floor(finite(next.dexterity) / 10) + finite(itemMods.criticalAttack?.flat)),
-      block: Math.max(0, Math.floor(finite(next.strength) / 10) + finite(itemMods.blockValue?.flat)),
-      avoidCritical: Math.max(0, Math.floor(finite(next.agility) / 10) + finite(itemMods.hardening?.flat))
+      critical: Math.max(0, Math.floor(finite(next.dexterity) / 10) + finite(pointBonuses.critical ?? itemMods.criticalAttack?.flat)),
+      block: Math.max(0, Math.floor(finite(next.strength) / 10) + finite(pointBonuses.block ?? itemMods.blockValue?.flat)),
+      avoidCritical: Math.max(0, Math.floor(finite(next.agility) / 10) + finite(pointBonuses.avoidCritical ?? itemMods.hardening?.flat))
     };
 
     const damageBaseline = next.baselines?.damageRange;
@@ -533,6 +564,12 @@
     next.criticalChance = calculateCriticalChance(next.level, next.dexterity, itemMods.criticalAttack?.flat || 0);
     next.blockChance = calculateBlockChance(next.level, next.strength, itemMods.blockValue?.flat || 0, numberOrNull(enemy.level) ?? 0);
     next.criticalAvoidance = calculateAvoidCritChance(next.level, next.agility, itemMods.hardening?.flat || 0);
+    const pointBonuses = next.dinoPointItemBonuses || {};
+    next.dinoPoints = {
+      critical: Math.max(0, Math.floor(finite(next.dexterity) / 10) + finite(pointBonuses.critical ?? itemMods.criticalAttack?.flat)),
+      block: Math.max(0, Math.floor(finite(next.strength) / 10) + finite(pointBonuses.block ?? itemMods.blockValue?.flat)),
+      avoidCritical: Math.max(0, Math.floor(finite(next.agility) / 10) + finite(pointBonuses.avoidCritical ?? itemMods.hardening?.flat))
+    };
 
     const damageBaseline = next.baselines?.damageRange;
     if (damageBaseline) {
@@ -801,6 +838,12 @@
     };
   }
 
+  function calculateChancesFromProfiles({ player, opponent } = {}) {
+    const attacker = normalizeBattleProfile(player, "player");
+    const defender = normalizeBattleProfile(opponent, "enemy");
+    return calculateDinoChances(attacker, defender);
+  }
+
   function simulateBattle({ player, enemy, seed = 1, maxRounds = DEFAULT_ARENA_ROUNDS, lifeMode = "current" } = {}) {
     const roundLimit = Math.max(1, Math.min(50, Math.floor(finite(maxRounds, DEFAULT_ARENA_ROUNDS))));
     const attacker = normalizeBattleProfile(player, "player");
@@ -847,12 +890,9 @@
       if (winner) return;
       const source = participants[sourceKey];
       const target = participants[targetKey];
-      const attackCount = 1 + (dinoRollPercent(rng, source.chances.doubleHit) ? 1 : 0);
-      counters[`${sourceKey}AttackOpportunities`]++;
-      if (attackCount > 1) counters[`${sourceKey}DoubleAttacks`]++;
-
-      for (let pairSequence = 1; pairSequence <= attackCount; pairSequence++) {
-        if (winner || life[targetKey] <= 0) break;
+      counters[`${sourceKey}AttackOpportunities` ]++;
+      const runHit = (pairSequence) => {
+        if (winner || life[targetKey] <= 0) return false;
         const key = sourceKey;
         counters[`${key}Attempts`]++;
         const hit = dinoHitSimulation(source.profile, target.profile, rng, source.chances, target.chances);
@@ -880,7 +920,7 @@
           counters[`${key}Misses`]++;
           event.resultText = "missed";
           events.push(event);
-          continue;
+          return true;
         }
 
         counters[`${key}Hits`]++;
@@ -904,6 +944,15 @@
           winner = sourceKey;
         }
         events.push(event);
+        return true;
+      };
+
+      // DinoDevs rolls the double-hit chance only after the first hit has resolved.
+      // This also prevents consuming a double-hit RNG roll when the first hit kills.
+      runHit(1);
+      if (!winner && life[targetKey] > 0 && dinoRollPercent(rng, source.chances.doubleHit)) {
+        counters[`${sourceKey}DoubleAttacks`]++;
+        runHit(2);
       }
     };
 
@@ -1499,6 +1548,8 @@
       baseArmour: options.baseArmour ?? null,
       baseLifeMax: options.baseLifeMax ?? null,
       recalculateDerived: options.recalculateDerived === true,
+      dinoPoints: options.dinoPoints || liveStats?.dinoPoints || null,
+      dinoPointItemBonuses: options.dinoPointItemBonuses || liveStats?.dinoPointItemBonuses || null,
       name: options.name || null
     });
   }
@@ -1529,6 +1580,7 @@
     createSeededRng,
     effectiveDamageRange,
     calculateDinoChances,
+    calculateChancesFromProfiles,
     simulateBattle,
     simulateBatch,
     simulateBatchAsync,

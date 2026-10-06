@@ -22,7 +22,8 @@
     },
     automation: {
       preActionDelayMinMs: 342,
-      preActionDelayMaxMs: 1967
+      preActionDelayMaxMs: 1967,
+      dungeonConsecutiveLossesBeforeReset: 2
     },
     economy: {
       foodCost: 245,

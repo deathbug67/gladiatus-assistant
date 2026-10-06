@@ -2,7 +2,7 @@
   "use strict";
 
   const api = globalThis.browser || globalThis.chrome;
-  const VERSION = "0.5.72";
+  const VERSION = "0.5.96";
   const STORAGE_KEY_PREFIX = "equipment:v0.2.5.9:";
   const OVERLAY_STATE_PREFIX = "overlay:v0.2.5.10:";
   const ACTIVE_TAB_PREFIX = "active-tab:v0.3.5:";
@@ -70,6 +70,11 @@
   const CIRCUS_REPORT_CAPTURE_TIMEOUT_MS = 8000;
   const CIRCUS_REPORT_LOADING_GRACE_MS = 12000;
   const CIRCUS_REPORT_RETRY_MS = 350;
+  const CIRCUS_CONFIRMATION_TIMEOUT_MS = 15000;
+  const CIRCUS_CONFIRMATION_RETRY_DELAY_MS = 750;
+  const CIRCUS_CONFIRMATION_RETRY_LIMIT = 3;
+  const ARENA_CONFIRMATION_RETRY_DELAY_MS = 750;
+  const ARENA_CONFIRMATION_RETRY_LIMIT = 3;
   const AUTO_COMBAT_GLOBAL_COOLDOWN_RETRY_MS = 1000;
   const AUTO_HEALING_STORAGE_PREFIX = "auto-healing:v0.4.6:";
   const AUTO_HEALING_TARGET_CONTAINER = "8";
@@ -243,19 +248,21 @@
   let arenaAutomationTimer = null;
   let arenaAutomationBusy = false;
   let arenaCombatStore = null;
-  let arenaOpponentAnalysisStore = { schemaVersion: 2, updatedAt: null, setSignature: null, playerProfile: null, opponents: {} };
+  let arenaOpponentAnalysisStore = { schemaVersion: 3, updatedAt: null, setSignature: null, analysisSeedBase: null, playerProfile: null, opponents: {} };
   let arenaAnalysisBusy = false;
   let arenaAnalysisPromise = null;
   let circusProvinciarumAutomationState = null;
   let circusProvinciarumAutomationTimer = null;
   let circusProvinciarumAutomationBusy = false;
-  let circusProvinciarumAnalysisStore = { schemaVersion: 1, updatedAt: null, setSignature: null, playerProfile: null, opponents: {} };
+  let circusProvinciarumAnalysisStore = { schemaVersion: 1, updatedAt: null, setSignature: null, analysisSeedBase: null, playerProfile: null, opponents: {} };
   let circusProvinciarumAnalysisBusy = false;
   let circusProvinciarumAnalysisPromise = null;
   let nativeOpponentWinRateObserver = null;
   let nativeOpponentWinRateRenderTimer = null;
   let nativeOpponentWinRateAutoAnalysisTimer = null;
   let nativeOpponentWinRateAutoAnalysisReady = false;
+  let nativeWinrateLastLoggedSignature = { arena: null, circus: null };
+  let nativeOpponentWinRateObservedSetSignature = { arena: null, circus: null };
   let nativeAuctionComparisonObserver = null;
   let nativeAuctionComparisonRenderTimer = null;
   let nativeAuctionComparisonListenersReady = false;
@@ -268,6 +275,8 @@
   let nativeItemTooltipHoveredElement = null;
   let nativeItemTooltipHoveredKey = "";
   let nativeItemTooltipRenderTimer = null;
+  let nativeItemTooltipLastPointerItem = null;
+  let nativeItemTooltipLastPointerAt = 0;
   let circusCombatStore = null;
   let dungeonCombatStore = null;
   let dungeonReportWaitStartedAt = 0;
@@ -392,6 +401,7 @@
   function combatKey() { return `${COMBAT_STORAGE_PREFIX}${hostnameKey()}`; }
   function simulatorStateKey() { return `${SIMULATOR_STATE_PREFIX}${hostnameKey()}`; }
   function statPriorityStateKey() { return `${STAT_PRIORITY_STORAGE_PREFIX}${hostnameKey()}`; }
+  function statPriorityDiagnosticKey() { return `${STAT_PRIORITY_DIAGNOSTIC_PREFIX}${hostnameKey()}`; }
   function currentStatsSnapshotKey() { return `${CURRENT_STATS_STORAGE_PREFIX}${hostnameKey()}`; }
   function characterProfileKey() { return `${CHARACTER_PROFILE_STORAGE_PREFIX}${hostnameKey()}`; }
   function characterCaptureWorkflowKey() { return `${CHARACTER_CAPTURE_WORKFLOW_PREFIX}${hostnameKey()}`; }
@@ -542,6 +552,21 @@
       if (!Number.isFinite(base)) missing.push(`${key} trained/base`);
       if (!Number.isFinite(max)) missing.push(`${key} maximum`);
     }
+    if (!profile?.equipment || !Object.values(profile.equipment).some(Boolean)) missing.push("equipment");
+    return [...new Set(missing)];
+  }
+
+  // Arena combat simulation only requires the current combat snapshot and
+  // equipped items. Stat-priority base/max metadata is intentionally not a
+  // prerequisite for Arena simulation. Keeping this separate also allows
+  // Arena to recover from a legacy/live-refresh profile that lacks nested
+  // statDetails while preserving that metadata for Stat Priority.
+  function characterProfileMissingArenaSimulationData(profile) {
+    const stats = profile?.stats || {};
+    const missing = REQUIRED_CURRENT_PROFILE_KEYS.filter(key => {
+      const raw = stats?.[key] ?? (key === "lifeMax" ? stats?.healthMax : undefined);
+      return raw == null || raw === "" || !Number.isFinite(Number(raw));
+    });
     if (!profile?.equipment || !Object.values(profile.equipment).some(Boolean)) missing.push("equipment");
     return [...new Set(missing)];
   }
@@ -999,6 +1024,19 @@
   }
 
   function deriveCombatOutcome(attackerName, defenderName, damageSummary, reward = null) {
+    const reportHeader = document.querySelector("#reportHeader");
+    const reportHeaderClass = String(reportHeader?.className || "").trim();
+
+    // Arena reports can omit the explicit "Winner:" heading on losses (and
+    // may also omit Reward entirely). The report header's final-result class
+    // is authoritative, just as it is for Dungeon/Circus reports.
+    if (/\breportWin\b/i.test(reportHeaderClass)) {
+      return { type: "win", winner: attackerName || null, source: "report-header-class" };
+    }
+    if (/\breportLose\b/i.test(reportHeaderClass)) {
+      return { type: "loss", winner: defenderName || null, source: "report-header-class" };
+    }
+
     const winnerCandidates = [...document.querySelectorAll("h1, h2, h3, h4, legend, .section-header")];
     let explicitWinner = "";
     for (const node of winnerCandidates) {
@@ -4081,6 +4119,71 @@
     return arenaTooltipPairs(rawTooltip).find(pair => rx.test(normalize(pair.label)))?.value ?? null;
   }
 
+  function parseAuthoritativeDinoPoints(root, rawHtml = "") {
+    // Use Gladiatus' own special-stat tooltip totals. The public DinoDevs
+    // PlayerStatsAPI reads the same values instead of reconstructing them from
+    // individual item modifiers, which can omit combined/item-side effects.
+    const readIndexed = (element, index) => {
+      const raw = element?.getAttribute?.("data-tooltip") || "";
+      try {
+        const data = typeof raw === "string" ? JSON.parse(raw) : raw;
+        const value = data?.[0]?.[index]?.[0]?.[1];
+        const parsed = typeof value === "number" ? value : parseLocalizedInteger(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      } catch (_) {
+        return null;
+      }
+    };
+
+    const armourTooltip = root?.querySelector?.("#char_panzer_tt[data-tooltip]") || null;
+    const damageTooltip = root?.querySelector?.("#char_schaden_tt[data-tooltip]") || null;
+    const avoidCritical = readIndexed(armourTooltip, 3);
+    const block = readIndexed(armourTooltip, 7);
+    const critical = readIndexed(damageTooltip, 6);
+
+    if ([avoidCritical, block, critical].every(Number.isFinite)) {
+      return { dinoPoints: { avoidCritical, block, critical }, source: "char-tooltip-indexed" };
+    }
+
+    // Fallback to the same narrow raw-HTML pattern used by DinoDevs.
+    const decoded = String(rawHtml || "")
+      .replace(/&quot;/gi, '"')
+      .replace(/&#34;/gi, '"')
+      .replace(/&amp;/gi, '&')
+      .replace(/&#x2F;/gi, '/')
+      .replace(/\\\//g, '/')
+      .replace(/\\\\\//g, '/');
+    const matches = [...decoded.matchAll(/",(-?\d+)\],\s*\["#BA9700","#BA9700"\]\]/gi)]
+      .map(match => Number(match[1]))
+      .filter(Number.isFinite);
+    if (matches.length > 9) {
+      return { dinoPoints: { avoidCritical: matches[7], block: matches[8], critical: matches[9] }, source: "raw-html-indexed" };
+    }
+    return { dinoPoints: null, source: null };
+  }
+
+  function parseArenaDisplayedCriticalPercent(root, dinoPoints, level) {
+    const tooltip = root?.querySelector?.("#char_schaden_tt[data-tooltip]")?.getAttribute?.("data-tooltip") || "";
+    const rows = arenaTooltipPairs(tooltip);
+    let percent = null;
+    const labeled = rows.find(row => /^Chance for critical damage$/i.test(normalize(row.label || "")))?.value;
+    if (labeled != null) percent = parsePercentage(String(labeled));
+    if (!Number.isFinite(percent)) {
+      const decoded = String(tooltip)
+        .replace(/&quot;/gi, '"')
+        .replace(/&#34;/gi, '"')
+        .replace(/&amp;/gi, '&');
+      const matches = [...decoded.matchAll(/","(\d+) %"\],\["#DDDDDD","#DDDDDD"\]\]/gi)]
+        .map(match => Number(match[1]))
+        .filter(Number.isFinite);
+      if (Number.isFinite(matches[2])) percent = matches[2];
+    }
+    if (!Number.isFinite(percent) || !dinoPoints || !Number.isFinite(Number(level))) return null;
+    const levelFactor = Math.max(2, Number(level) - 8);
+    const withoutVeteran = Math.round(Number(dinoPoints.critical) * 52 / levelFactor / 5);
+    return { displayedPercent: percent, formulaWithoutVeteran: withoutVeteran, veteranDetected: percent - withoutVeteran === 10 };
+  }
+
   function parseArenaLifePoints(root, doc, rawHtml = "") {
     const elements = [];
     const pushUnique = el => {
@@ -4162,6 +4265,14 @@
     let roleTooltip = null;
     try { dollId = new URL(profileUrl || location.href, location.href).searchParams.get("doll") || null; } catch (_) {}
     dollId = dollId || root.ownerDocument?.querySelector("#plDoll")?.value || doc.querySelector("#plDoll")?.value || null;
+    // Some Gladiatus profile responses omit the hidden #plDoll input even
+    // though the page still declares the selected doll in its bootstrap
+    // JavaScript. Use that server-provided declaration before treating the
+    // doll as unknown.
+    if (!dollId) {
+      const declaredDoll = String(html).match(/\b(?:var|let|const)\s+dollId\s*=\s*["\']?(\d+)["\']?\s*;/i);
+      if (declaredDoll) dollId = declaredDoll[1];
+    }
     const activeDoll = doc.querySelector(".charmercsel.active .charmercpic") || (dollId ? doc.querySelector(`.charmercpic.doll${CSS.escape(String(dollId))}`) : null);
     if (activeDoll) {
       const tooltip = activeDoll.getAttribute("data-tooltip") || "";
@@ -4191,6 +4302,10 @@
       damageMin: null, damageMax: null, damageRange: null,
       healing: parseLocalizedInteger(root.querySelector("#char_healing")?.textContent || ""),
       hitChance: null, doubleHit: null, criticalChance: null, blockChance: null, criticalAvoidance: null, criticalHealingValue: null, threat: null,
+      dinoPoints: null,
+      dinoPointItemBonuses: null,
+      dinoPointSource: null,
+      buffs: { minerva: false, mars: false, apollo: false, honour_veteran: false, honour_destroyer: false },
       itemModifiers: {
         criticalAttack: { flat: 0, percent: 0 },
         blockValue: { flat: 0, percent: 0 },
@@ -4241,6 +4356,38 @@
       }
     }
 
+    const authoritativeDino = parseAuthoritativeDinoPoints(root, html);
+    if (authoritativeDino.dinoPoints) {
+      out.dinoPoints = {
+        avoidCritical: Math.max(0, Number(authoritativeDino.dinoPoints.avoidCritical)),
+        block: Math.max(0, Number(authoritativeDino.dinoPoints.block)),
+        critical: Math.max(0, Number(authoritativeDino.dinoPoints.critical))
+      };
+      out.dinoPointSource = authoritativeDino.source;
+      out.dinoPointItemBonuses = {
+        avoidCritical: Math.max(0, out.dinoPoints.avoidCritical - Math.floor(Number(out.agility) / 10)),
+        block: Math.max(0, out.dinoPoints.block - Math.floor(Number(out.strength) / 10)),
+        critical: Math.max(0, out.dinoPoints.critical - Math.floor(Number(out.dexterity) / 10))
+      };
+      const critDetection = parseArenaDisplayedCriticalPercent(root, out.dinoPoints, out.level);
+      if (critDetection) {
+        out.criticalChance = critDetection.displayedPercent;
+        out.buffs.honour_veteran = critDetection.veteranDetected;
+      }
+    } else {
+      out.dinoPoints = {
+        avoidCritical: Math.max(0, Math.floor(Number(out.agility) / 10) + Number(out.itemModifiers.hardening.flat || 0)),
+        block: Math.max(0, Math.floor(Number(out.strength) / 10) + Number(out.itemModifiers.blockValue.flat || 0)),
+        critical: Math.max(0, Math.floor(Number(out.dexterity) / 10) + Number(out.itemModifiers.criticalAttack.flat || 0))
+      };
+      out.dinoPointItemBonuses = {
+        avoidCritical: Number(out.itemModifiers.hardening.flat || 0),
+        block: Number(out.itemModifiers.blockValue.flat || 0),
+        critical: Number(out.itemModifiers.criticalAttack.flat || 0)
+      };
+      out.dinoPointSource = "item-modifier-fallback";
+    }
+
     const validCore = ["level","lifeCurrent","lifeMax","strength","dexterity","agility","constitution","charisma","intelligence","armour","damageMin","damageMax"];
     const missing = validCore.filter(key => !Number.isFinite(Number(out[key])));
     if (Number.isFinite(Number(out.lifeMax)) && Number(out.lifeMax) <= 1) missing.push("lifeMax(valid > 1)");
@@ -4257,14 +4404,103 @@
     };
   }
 
+  function buildArenaOpponentStandardProfileUrl(profileUrl, playerId) {
+    try {
+      const u = new URL(profileUrl || location.href, location.href);
+      u.searchParams.set("mod", "player");
+      if (playerId != null && String(playerId)) u.searchParams.set("p", String(playerId));
+      // Arena simulations must always use the opponent's standard/main
+      // character (doll 1). Alternate dolls such as Druid Master are valid
+      // Circus Provinciarum fighters, but are never valid Arena opponents.
+      u.searchParams.set("doll", "1");
+      return u.href;
+    } catch (_) {
+      return null;
+    }
+  }
+
   async function fetchArenaOpponentProfile(opponent) {
     if (!opponent?.profileUrl) return { ok: false, error: "No opponent profile URL." };
+    const profileUrl = buildArenaOpponentStandardProfileUrl(opponent.profileUrl, opponent.playerId);
+    if (!profileUrl) return { ok: false, error: "Could not construct the standard Arena opponent profile URL." };
     try {
-      const response = await runtimeSend({ type: "FETCH_GLADIATUS_PROFILE", url: opponent.profileUrl });
-      if (!response?.ok || typeof response.html !== "string") return { ok: false, error: response?.error || "Opponent profile request failed." };
-      return parseArenaProfileDocument(response.html, response.finalUrl || opponent.profileUrl, opponent);
+      const response = await runtimeSend({ type: "FETCH_GLADIATUS_PROFILE", url: profileUrl });
+      if (!response?.ok || typeof response.html !== "string") {
+        return { ok: false, error: response?.error || "Opponent profile request failed.", profileUrl };
+      }
+
+      const finalUrl = response.finalUrl || profileUrl;
+      try {
+        const final = new URL(finalUrl, profileUrl);
+        const returnedPlayerId = final.searchParams.get("p");
+        if (returnedPlayerId && String(returnedPlayerId) !== String(opponent.playerId)) {
+          return {
+            ok: false,
+            error: `Arena opponent profile returned player ${returnedPlayerId} instead of ${opponent.playerId}.`,
+            profileUrl, finalUrl
+          };
+        }
+        const returnedDollId = final.searchParams.get("doll");
+        if (returnedDollId && String(returnedDollId) !== "1") {
+          return {
+            ok: false,
+            error: `Arena opponent profile returned doll ${returnedDollId} instead of standard doll 1.`,
+            profileUrl, finalUrl
+          };
+        }
+      } catch (_) {}
+
+      // Gladiatus may strip the doll query parameter from the final/redirected URL.
+      // Parse with the explicit requested Arena profile URL so doll=1 remains
+      // authoritative for this Arena-only fetch. Circus Provinciarum uses its
+      // own fetchCircusProvinciarumDoll() path and is intentionally untouched.
+      const parsed = parseArenaProfileDocument(response.html, profileUrl, opponent);
+      if (!parsed?.ok) return { ...parsed, profileUrl, finalUrl };
+
+      // Validate the character selected inside the returned document as well
+      // as the request URL. This catches servers/pages that ignore or rewrite
+      // the doll query parameter and would otherwise feed a mercenary profile
+      // into the Arena simulator.
+      if (String(parsed.dollId || "") !== "1") {
+        // The explicit Arena request is the authoritative selector when the
+        // returned document omits all doll markers. Do not reject a complete
+        // main-character profile merely because Gladiatus stripped #plDoll and
+        // its bootstrap declaration. A contradictory explicit doll marker is
+        // still rejected.
+        const requestedDollId = (() => {
+          try { return new URL(profileUrl, location.href).searchParams.get("doll") || null; } catch (_) { return null; }
+        })();
+        if (!parsed.dollId && String(requestedDollId || "") === "1") {
+          parsed.dollId = "1";
+          logAutoCombatDiagnostic("arena-opponent-profile-doll-inferred-from-request", {
+            opponent: { key: opponent.key, name: opponent.name, playerId: opponent.playerId },
+            requestedDollId: "1",
+            finalProfileUrl: finalUrl
+          });
+        } else {
+          return {
+            ok: false,
+            error: `Arena opponent profile resolved to doll ${parsed.dollId || "unknown"} instead of standard doll 1.`,
+            profileUrl,
+            finalUrl,
+            stats: parsed.stats || null
+          };
+        }
+      }
+
+      logAutoCombatDiagnostic("arena-opponent-profile-validated", {
+        opponent: { key: opponent.key, name: opponent.name, playerId: opponent.playerId },
+        requestedDollId: "1",
+        returnedDollId: parsed.dollId,
+        requestedProfileUrl: profileUrl,
+        finalProfileUrl: finalUrl,
+        capturedName: parsed.name,
+        capturedLevel: parsed.stats?.level ?? null
+      });
+
+      return { ...parsed, profileUrl, finalUrl };
     } catch (error) {
-      return { ok: false, error: error?.message || String(error) };
+      return { ok: false, error: error?.message || String(error), profileUrl };
     }
   }
 
@@ -4278,9 +4514,10 @@
       const stored = result?.[arenaOpponentAnalysisKey()];
       if (stored && typeof stored === "object") {
         arenaOpponentAnalysisStore = {
-          schemaVersion: 2,
+          schemaVersion: 3,
           updatedAt: stored.updatedAt || null,
           setSignature: stored.setSignature || null,
+          analysisSeedBase: Number.isFinite(Number(stored.analysisSeedBase)) ? Number(stored.analysisSeedBase) : null,
           playerProfile: stored.playerProfile && typeof stored.playerProfile === "object" ? { ...stored.playerProfile } : null,
           opponents: stored.opponents && typeof stored.opponents === "object" ? { ...stored.opponents } : {}
         };
@@ -4381,15 +4618,24 @@
       roleRaw: previous.roleRaw || character?.roleRaw || "Standard Battle",
       roleTooltip: previous.roleTooltip || character?.roleTooltip || null,
       url: finalUrl,
-      stats: { ...state },
+      stats: {
+        ...(previous.stats || {}),
+        ...state,
+        statDetails: { ...(previous.stats?.statDetails || {}), ...(state?.statDetails || {}) }
+      },
       statsUpdatedAt: now,
       capturedAt: previous.capturedAt || now,
       equipment: previous.equipment || {},
       equipmentUpdatedAt: previous.equipmentUpdatedAt || previous.capturedAt || now
     };
     await saveCharacterProfileStore();
-    latestParsedState = { ...state };
-    return { stats: { ...state }, character: { ...character, name: state.name, playerId, dollId: "1" }, profile: parsed.stats, profileUrl: finalUrl };
+    const mergedState = {
+      ...(previous.stats || {}),
+      ...state,
+      statDetails: { ...(previous.stats?.statDetails || {}), ...(state?.statDetails || {}) }
+    };
+    latestParsedState = { ...mergedState };
+    return { stats: { ...mergedState }, character: { ...character, name: state.name, playerId, dollId: "1" }, profile: parsed.stats, profileUrl: finalUrl };
   }
 
   function mainArenaSimulatorProfile(liveStats = null, liveHp = null) {
@@ -4416,47 +4662,135 @@
     return globalSimulationCount();
   }
 
-  function arenaSimulationSeedForOpponent(opponent) {
+  function arenaSimulationSeedForOpponent(opponent, seedBase = 0) {
     let hash = 2166136261;
-    const text = String(opponent?.key || "");
+    const text = `${String(opponent?.key || "")}|${String(seedBase || 0)}`;
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
     return (hash >>> 0) || 1;
   }
 
-  async function performArenaOpponentAnalysis(opponents) {
+  // Simulation caches are deliberately short-lived. A cached matchup may become
+  // invalid after equipment/stat changes or after another module changes the
+  // player's current HP. We also fingerprint the actual simulation inputs.
+  const ARENA_ANALYSIS_CACHE_MAX_AGE_MS = 15000;
+  const CIRCUS_ANALYSIS_CACHE_MAX_AGE_MS = 15000;
+
+  function stableSimulationSerialize(value) {
+    if (value === null) return "null";
+    if (typeof value === "number") return Number.isFinite(value) ? String(value) : "null";
+    if (typeof value === "boolean") return value ? "true" : "false";
+    if (typeof value === "string") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(stableSimulationSerialize).join(",")}]`;
+    if (typeof value === "object") {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableSimulationSerialize(value[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(String(value));
+  }
+
+  function simulationInputFingerprint(value) {
+    let hash = 2166136261;
+    const text = stableSimulationSerialize(value);
+    for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  }
+
+  function newSimulationSeedBase() {
+    try {
+      if (globalThis.crypto?.getRandomValues) {
+        const values = new Uint32Array(2);
+        globalThis.crypto.getRandomValues(values);
+        return ((values[0] ^ values[1]) >>> 0) || 1;
+      }
+    } catch (_) {}
+    return ((Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0) || 1;
+  }
+
+  function arenaPlayerSimulationFingerprint(stats, equipment) {
+    return simulationInputFingerprint({
+      stats: {
+        level: stats?.level, strength: stats?.strength, dexterity: stats?.dexterity, agility: stats?.agility,
+        constitution: stats?.constitution, charisma: stats?.charisma, intelligence: stats?.intelligence,
+        armour: stats?.armour, damageMin: stats?.damageMin, damageMax: stats?.damageMax, healing: stats?.healing,
+        dinoPoints: stats?.dinoPoints || null, dinoPointItemBonuses: stats?.dinoPointItemBonuses || null,
+        buffs: stats?.buffs || null,
+        itemModifiers: stats?.itemModifiers || null
+      },
+      equipment: equipment || {}
+    });
+  }
+
+  function circusTeamSimulationFingerprint(roster) {
+    return simulationInputFingerprint((Array.isArray(roster) ? roster : []).map(profile => ({
+      dollId: profile?.dollId, name: profile?.name, roleKey: profile?.roleKey,
+      stats: profile?.stats || {}, equipment: profile?.equipment || {}
+    })).sort((a, b) => String(a.dollId).localeCompare(String(b.dollId))));
+  }
+
+  function arenaOpponentSimulationFingerprint(stats) {
+    return simulationInputFingerprint({
+      level: stats?.level, strength: stats?.strength, dexterity: stats?.dexterity, agility: stats?.agility,
+      constitution: stats?.constitution, charisma: stats?.charisma, intelligence: stats?.intelligence,
+      armour: stats?.armour, damageMin: stats?.damageMin, damageMax: stats?.damageMax, lifeMax: stats?.lifeMax,
+      dinoPoints: stats?.dinoPoints || null, dinoPointItemBonuses: stats?.dinoPointItemBonuses || null,
+      buffs: stats?.buffs || null, itemModifiers: stats?.itemModifiers || null
+    });
+  }
+
+  function calculateArenaInputChance(player, opponent, key) {
+    try {
+      const engine = simulatorEngine();
+      if (!engine || typeof engine.calculateChancesFromProfiles !== "function") return null;
+      const chances = engine.calculateChancesFromProfiles({ player, opponent });
+      return Number.isFinite(Number(chances?.[key])) ? Number(chances[key]) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function performArenaOpponentAnalysis(opponents, preparedContext = null) {
     arenaAnalysisBusy = true;
     renderNativeOpponentWinRateBadges();
     renderAutoCombatUI();
     try {
       await loadCharacterProfileStore();
       await loadArenaOpponentAnalysisStore();
-      const hp = readLiveHpSnapshot();
+      const hp = preparedContext?.playerHp || readLiveHpSnapshot();
       const mainProfile = characterProfileStore.characters?.["1"] || null;
-      const missingMainData = characterProfileMissingSimulationData(mainProfile);
-      if (!mainProfile || missingMainData.length) return { ok: false, reason: "main-profile-unavailable", error: `Complete saved main-character stats/equipment are required. Missing: ${missingMainData.join(", ") || "saved profile"}.`, playerHp: hp };
-      const playerCurrent = mainArenaSimulatorProfile(mainProfile.stats, hp);
+      const missingMainData = characterProfileMissingArenaSimulationData(mainProfile);
+      if (!mainProfile || missingMainData.length) return { ok: false, reason: "main-profile-unavailable", error: `Complete saved main-character stats/equipment are required for Arena simulation. Missing: ${missingMainData.join(", ") || "saved profile"}.`, playerHp: hp };
+      const playerStats = preparedContext?.playerStats || mainProfile.stats;
+      const playerCurrent = mainArenaSimulatorProfile(playerStats, hp);
+      const playerFingerprint = preparedContext?.playerFingerprint || arenaPlayerSimulationFingerprint(playerStats, mainProfile.equipment || {});
       const engine = simulatorEngine();
       if (!playerCurrent || !engine) {
         return { ok: false, reason: "main-profile-unavailable", error: "Complete main-character stats/equipment are required before Arena simulation.", playerHp: hp };
       }
 
       const setSignature = arenaAnalysisSetSignature(opponents);
+      const analysisSeedBase = newSimulationSeedBase();
       const results = {};
       let failures = 0;
       for (const opponent of opponents) {
         const fetched = await withArenaAnalysisTimeout(fetchArenaOpponentProfile(opponent), 12000, `Opponent profile (${opponent.name})`);
         if (!fetched.ok) {
           failures++;
+          const capturedAt = new Date().toISOString();
           results[opponent.key] = {
             key: opponent.key, name: opponent.name, playerId: opponent.playerId, province: opponent.province,
-            level: opponent.level, ok: false, error: fetched.error || "Could not capture opponent profile.", capturedAt: new Date().toISOString()
+            level: opponent.level, ok: false, unavailable: true, failureStage: "profile-capture",
+            error: fetched.error || "Could not capture opponent profile.", capturedAt
           };
+          logAutoCombatDiagnostic("arena-opponent-analysis-failure", {
+            opponent: { key: opponent.key, name: opponent.name, playerId: opponent.playerId },
+            stage: "profile-capture", error: results[opponent.key].error
+          });
           continue;
         }
         try {
           const enemy = fetched.stats;
+          const opponentFingerprint = arenaOpponentSimulationFingerprint(enemy);
           const currentPlayer = { ...playerCurrent };
-          const currentSeed = arenaSimulationSeedForOpponent(opponent);
+          const currentSeed = arenaSimulationSeedForOpponent(opponent, analysisSeedBase);
           const count = arenaSimulationCount();
           const simulationOptions = { simulations: count, seed: currentSeed, maxRounds: ARENA_SIMULATION_ROUNDS };
           const current = engine.simulateBatch({ player: currentPlayer, enemy, ...simulationOptions, lifeMode: "current" });
@@ -4483,34 +4817,74 @@
               charisma: enemy.charisma,
               intelligence: enemy.intelligence,
               armour: enemy.armour,
-              damageMin: enemy.damageMin,
+                damageMin: enemy.damageMin,
               damageMax: enemy.damageMax,
+              dinoPoints: enemy.dinoPoints || null,
+              dinoPointItemBonuses: enemy.dinoPointItemBonuses || null,
+              buffs: enemy.buffs || null,
               itemModifiers: enemy.itemModifiers
             },
-            source: { profileUrl: opponent.profileUrl, playerId: opponent.playerId, province: opponent.province, capturedAt: fetched.capturedAt },
+            source: { profileUrl: fetched.profileUrl || opponent.profileUrl, finalProfileUrl: fetched.finalUrl || null, requestedDollId: "1", playerId: opponent.playerId, province: opponent.province, capturedAt: fetched.capturedAt },
             currentHp: { player: currentPlayer.lifeCurrent, playerMax: currentPlayer.lifeMax, enemy: enemy.lifeCurrent, enemyMax: enemy.lifeMax },
             simulations: count,
             maxRounds: ARENA_SIMULATION_ROUNDS,
             seed: currentSeed,
+            playerFingerprint,
+            opponentFingerprint,
             current: { winRate: currentWinRate, lossRate: Number(current?.rates?.loss || 0), unknownRate: Number(current?.rates?.unknown || 0), avgPlayerDamage: Number(current?.averages?.playerDamage || 0), avgEnemyDamage: Number(current?.averages?.enemyDamage || 0) },
             full: { winRate: fullWinRate, lossRate: Number(full?.rates?.loss || 0), unknownRate: Number(full?.rates?.unknown || 0) },
             hpImpact: Math.max(0, fullWinRate - currentWinRate),
             analyzedAt: new Date().toISOString()
           };
           results[opponent.key].profile.itemModifiers = enemy.itemModifiers;
+          logAutoCombatDiagnostic("arena-opponent-analysis-input", {
+            opponent: { key: opponent.key, name: opponent.name, playerId: opponent.playerId },
+            player: {
+              level: playerCurrent.level, lifeCurrent: playerCurrent.lifeCurrent, lifeMax: playerCurrent.lifeMax,
+              strength: playerCurrent.strength, dexterity: playerCurrent.dexterity, agility: playerCurrent.agility,
+              charisma: playerCurrent.charisma, intelligence: playerCurrent.intelligence,
+              damageMin: playerCurrent.damageMin, damageMax: playerCurrent.damageMax, armour: playerCurrent.armour,
+              dinoPoints: playerCurrent.dinoPoints, buffs: playerCurrent.buffs,
+              hitChance: calculateArenaInputChance(playerCurrent, enemy, "hitChance"),
+              doubleHit: calculateArenaInputChance(playerCurrent, enemy, "doubleHit"),
+              criticalChance: calculateArenaInputChance(playerCurrent, enemy, "criticalChance"),
+              blockChance: calculateArenaInputChance(playerCurrent, enemy, "blockChance"),
+              criticalAvoidance: calculateArenaInputChance(enemy, playerCurrent, "criticalAvoidance")
+            },
+            opponentProfile: {
+              level: enemy.level, lifeCurrent: enemy.lifeCurrent, lifeMax: enemy.lifeMax,
+              strength: enemy.strength, dexterity: enemy.dexterity, agility: enemy.agility,
+              charisma: enemy.charisma, intelligence: enemy.intelligence,
+              damageMin: enemy.damageMin, damageMax: enemy.damageMax, armour: enemy.armour,
+              dinoPoints: enemy.dinoPoints, buffs: enemy.buffs,
+              fingerprint: opponentFingerprint
+            },
+            current: { winRate: currentWinRate, lossRate: Number(current?.rates?.loss || 0), unknownRate: Number(current?.rates?.unknown || 0) },
+            full: { winRate: fullWinRate, lossRate: Number(full?.rates?.loss || 0), unknownRate: Number(full?.rates?.unknown || 0) },
+            simulations: count, seed: currentSeed
+          });
         } catch (error) {
           failures++;
-          results[opponent.key] = { key: opponent.key, name: opponent.name, playerId: opponent.playerId, province: opponent.province, level: opponent.level, ok: false, error: `Simulation failed: ${error?.message || String(error)}`, capturedAt: new Date().toISOString() };
+          const errorText = `Simulation failed: ${error?.message || String(error)}`;
+          results[opponent.key] = { key: opponent.key, name: opponent.name, playerId: opponent.playerId, province: opponent.province, level: opponent.level, ok: false, unavailable: true, failureStage: "simulation", error: errorText, capturedAt: new Date().toISOString() };
+          logAutoCombatDiagnostic("arena-opponent-analysis-failure", {
+            opponent: { key: opponent.key, name: opponent.name, playerId: opponent.playerId },
+            stage: "simulation", error: errorText, stack: error?.stack || null
+          });
         }
       }
       arenaOpponentAnalysisStore = {
-        schemaVersion: 2,
+        schemaVersion: 3,
         updatedAt: new Date().toISOString(),
         setSignature,
+        analysisSeedBase,
         playerProfile: {
           name: playerCurrent.name,
           sourceDollId: "1",
           playerId: mainProfile.playerId || null,
+          simulationFingerprint: playerFingerprint,
+          simulationHpCurrent: Number.isFinite(Number(hp?.current)) ? Number(hp.current) : null,
+          simulationHpMax: Number.isFinite(Number(hp?.max)) ? Number(hp.max) : null,
           sourceProfileUrl: mainProfile.url || null,
           liveStatsCapturedAt: playerCurrent.liveStatsCapturedAt,
           stats: { ...(mainProfile.stats || {}) },
@@ -4521,7 +4895,15 @@
       await saveArenaOpponentAnalysisStore();
       try { renderCombatTab(); } catch (_) {}
       const completed = Object.values(results).filter(x => x?.ok).length;
-      return { ok: completed === opponents.length, completed, total: opponents.length, failures, playerHp: hp, setSignature, results, playerProfile: arenaOpponentAnalysisStore.playerProfile };
+      const partial = completed > 0 && completed < opponents.length;
+      if (partial) {
+        logAutoCombatDiagnostic("arena-opponent-analysis-partial", {
+          completed, total: opponents.length, failures,
+          usableTargets: Object.values(results).filter(x => x?.ok).map(x => ({ key: x.key, name: x.name, winRate: x.current?.winRate ?? null })),
+          failedTargets: Object.values(results).filter(x => !x?.ok).map(x => ({ key: x.key, name: x.name, stage: x.failureStage || null, error: x.error || null }))
+        });
+      }
+      return { ok: completed > 0, reason: partial ? "partial-opponents" : completed === 0 ? "no-usable-opponents" : null, completed, total: opponents.length, failures, playerHp: hp, setSignature, results, playerProfile: arenaOpponentAnalysisStore.playerProfile };
     } catch (error) {
       logAutoCombatDiagnostic("arena-analysis-error", { error: error?.message || String(error), stack: error?.stack || null });
       return { ok: false, reason: "analysis-error", error: error?.message || String(error) };
@@ -4532,13 +4914,26 @@
     }
   }
 
-  function arenaAnalysisCacheIsCurrent(opponents) {
+  function arenaAnalysisCacheIsCurrent(opponents, context = null) {
     if (!Array.isArray(opponents) || !opponents.length) return false;
     if (arenaOpponentAnalysisStore?.setSignature !== arenaAnalysisSetSignature(opponents)) return false;
     const simulations = arenaSimulationCount();
+    const updatedAtMs = Date.parse(String(arenaOpponentAnalysisStore?.updatedAt || ""));
+    if (!Number.isFinite(updatedAtMs) || Date.now() - updatedAtMs > ARENA_ANALYSIS_CACHE_MAX_AGE_MS) return false;
+    const playerProfile = arenaOpponentAnalysisStore?.playerProfile || null;
+    if (context?.playerFingerprint && String(playerProfile?.simulationFingerprint || "") !== String(context.playerFingerprint)) return false;
+    if (context?.playerHp?.current != null && Number.isFinite(Number(playerProfile?.simulationHpCurrent))
+      && Number(context.playerHp.current) !== Number(playerProfile.simulationHpCurrent)) return false;
+    if (context?.playerHp?.max != null && Number.isFinite(Number(playerProfile?.simulationHpMax))
+      && Number(context.playerHp.max) !== Number(playerProfile.simulationHpMax)) return false;
     return opponents.every(op => {
       const result = arenaOpponentAnalysisStore?.opponents?.[op.key];
-      return result?.ok === true && Number(result.simulations) === simulations && Number.isFinite(Number(result.current?.winRate));
+      if (result?.ok === true) {
+        return Number(result.simulations) === simulations
+          && Number.isFinite(Number(result.current?.winRate))
+          && String(result.playerFingerprint || "") === String(context?.playerFingerprint || playerProfile?.simulationFingerprint || "");
+      }
+      return result?.unavailable === true && typeof result.error === "string" && !!result.error;
     });
   }
 
@@ -4549,22 +4944,34 @@
     if (arenaAnalysisPromise) return arenaAnalysisPromise;
 
     arenaAnalysisPromise = (async () => {
+      let freshMain = null;
+      try {
+        freshMain = await freshMainArenaStatsForAnalysis();
+      } catch (error) {
+        logAutoCombatDiagnostic("arena-analysis-fresh-player-capture-failed", { error: error?.message || String(error), stack: error?.stack || null });
+        return { ok: false, reason: "main-profile-refresh-failed", error: error?.message || String(error) };
+      }
+      await loadCharacterProfileStore();
+      const playerHp = readLiveHpSnapshot();
+      const equipment = characterProfileStore.characters?.["1"]?.equipment || {};
+      const playerFingerprint = arenaPlayerSimulationFingerprint(freshMain?.stats, equipment);
+      const context = { playerStats: freshMain?.stats, playerHp, playerFingerprint };
       await loadArenaOpponentAnalysisStore();
-      if (arenaAnalysisCacheIsCurrent(opponents)) {
+      if (arenaAnalysisCacheIsCurrent(opponents, context)) {
         renderNativeOpponentWinRateBadges();
         return {
           ok: true,
           reused: true,
           reason: "cached",
-          completed: opponents.length,
+          completed: Object.values(arenaOpponentAnalysisStore.opponents || {}).filter(x => x?.ok).length,
           total: opponents.length,
-          failures: 0,
+          failures: Object.values(arenaOpponentAnalysisStore.opponents || {}).filter(x => !x?.ok).length,
           setSignature: arenaOpponentAnalysisStore.setSignature,
           results: arenaOpponentAnalysisStore.opponents,
           playerProfile: arenaOpponentAnalysisStore.playerProfile
         };
       }
-      return performArenaOpponentAnalysis(opponents);
+      return performArenaOpponentAnalysis(opponents, context);
     })();
     try {
       return await arenaAnalysisPromise;
@@ -4587,12 +4994,89 @@
     return { needed: true, threshold, maxImpact, candidates: candidates.map(row => ({ name: row.name, key: row.key, hpImpact: row.hpImpact, currentWinRate: row.current?.winRate, fullWinRate: row.full?.winRate })) };
   }
 
+  function elementIsActuallyVisible(element) {
+    if (!element || !element.isConnected) return false;
+    for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && Number.isFinite(rect.left) && Number.isFinite(rect.top);
+  }
+
   function visibleArenaConfirmationButton() {
-    const button = document.querySelector("#blackoutDialognotification #linkbod, #linkbod");
-    const dialog = document.querySelector("#blackoutDialognotification");
-    if (!button) return null;
-    const visible = (!dialog || getComputedStyle(dialog).display !== "none") && getComputedStyle(button).display !== "none";
-    return visible ? button : null;
+    const candidates = [
+      ...document.querySelectorAll("#blackoutDialogbod #linkbod, #blackoutDialognotification #linkbod, input#linkbod, button#linkbod")
+    ];
+    const seen = new Set();
+    for (const button of candidates) {
+      if (seen.has(button)) continue;
+      seen.add(button);
+      if (elementIsActuallyVisible(button)) return button;
+    }
+    return null;
+  }
+
+  function visibleCircusProvinciarumConfirmationButton() {
+    const candidates = [
+      ...document.querySelectorAll("#blackoutDialogbod #linkbod, #blackoutDialognotification #linkbod, input#linkbod, button#linkbod")
+    ];
+    const seen = new Set();
+    for (const button of candidates) {
+      if (seen.has(button)) continue;
+      seen.add(button);
+      const onclick = String(button.getAttribute("onclick") || "");
+      const isCircusConfirm = /startProvinciarumFightConfirmed\s*\(/i.test(onclick);
+      if (isCircusConfirm && elementIsActuallyVisible(button)) return button;
+    }
+    return null;
+  }
+
+  async function waitForCircusProvinciarumConfirmation({ timeoutMs = CIRCUS_CONFIRMATION_TIMEOUT_MS, cooldownBeforeClickMs = null } = {}) {
+    const started = Date.now();
+    const check = () => {
+      if (isCombatReportPage() && circusReportDetection().isCircus) {
+        return { kind: "report", reportId: reportIdFromUrl(), elapsedMs: Date.now() - started };
+      }
+      const button = visibleCircusProvinciarumConfirmationButton();
+      if (button) return { kind: "confirmation", button, elapsedMs: Date.now() - started };
+      const cooldownNow = circusProvinciarumCooldownMs();
+      if (Number.isFinite(cooldownBeforeClickMs) && cooldownBeforeClickMs <= 0 && Number.isFinite(cooldownNow) && cooldownNow > 0) {
+        return { kind: "cooldown", cooldownMs: cooldownNow, elapsedMs: Date.now() - started };
+      }
+      return null;
+    };
+
+    const immediate = check();
+    if (immediate) return immediate;
+
+    return await new Promise(resolve => {
+      let settled = false;
+      let observer = null;
+      let interval = null;
+      let timeout = null;
+      const finish = result => {
+        if (settled) return;
+        settled = true;
+        if (observer) observer.disconnect();
+        if (interval) clearInterval(interval);
+        if (timeout) clearTimeout(timeout);
+        resolve(result);
+      };
+      const poll = () => {
+        const result = check();
+        if (result) finish(result);
+      };
+      try {
+        if (document.body) {
+          observer = new MutationObserver(poll);
+          observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["style", "class", "id"] });
+        }
+      } catch (_) {}
+      interval = setInterval(poll, 200);
+      timeout = setTimeout(() => finish({ kind: "timeout", elapsedMs: Date.now() - started }), Math.max(250, timeoutMs));
+      poll();
+    });
   }
 
   async function recoverStaleCircusProvinciarumActionState() {
@@ -4620,8 +5104,26 @@
       return true;
     }
 
+    const recoveryCooldownMs = circusProvinciarumCooldownMs();
+    if (Number.isFinite(recoveryCooldownMs) && recoveryCooldownMs > 0) {
+      if (state.pendingTargetKey) {
+        state.attemptedOpponents = state.attemptedOpponents || {};
+        if (!Object.prototype.hasOwnProperty.call(state.attemptedOpponents, state.pendingTargetKey)) {
+          state.attemptedOpponents[state.pendingTargetKey] = { name: state.pendingTargetName || "", attemptedAt: new Date().toISOString(), recovered: true };
+        }
+      }
+      state.phase = "waiting-report";
+      state.error = "Circus Provinciarum cooldown is active; treating the pending action as already started and refusing another click.";
+      setModuleReadiness("provinciarum", null);
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-stale-state-cooldown-guard", { cooldownMs: recoveryCooldownMs, pendingTargetName: state.pendingTargetName || null });
+      scheduleAutoCombatResume(350, "provinciarum-stale-state-cooldown-guard");
+      return true;
+    }
+
     if (isCircusProvinciarumPage() && state.pendingTargetKey) {
-      const confirmButton = visibleArenaConfirmationButton();
+      const confirmButton = visibleCircusProvinciarumConfirmationButton();
       if (confirmButton) {
         state.phase = "humanizing";
         state.error = null;
@@ -4641,6 +5143,14 @@
           target: state.pendingTargetName || null
         });
         if (confirmed && state.enabled) {
+          const pendingOpponent = state.pendingTargetKey ? String(state.pendingTargetKey) : null;
+          if (pendingOpponent && !Object.prototype.hasOwnProperty.call(state.attemptedOpponents || {}, pendingOpponent)) {
+            state.attemptedOpponents[pendingOpponent] = {
+              name: state.pendingTargetName || "", attemptedAt: new Date().toISOString(), recovered: true
+            };
+          }
+          state.confirmationRetryCount = 0;
+          state.confirmationRetryTargetKey = null;
           state.phase = "waiting-report";
           state.error = null;
           await saveCircusProvinciarumAutomationState();
@@ -4754,9 +5264,9 @@
     return arenaSimulationCount();
   }
 
-  function circusProvinciarumSimulationSeedForOpponent(opponent) {
+  function circusProvinciarumSimulationSeedForOpponent(opponent, seedBase = 0) {
     let hash = 2166136261;
-    const text = `circus-provinciarum|${String(opponent?.key || "")}`;
+    const text = `circus-provinciarum|${String(opponent?.key || "")}|${String(seedBase || 0)}`;
     for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
     return (hash >>> 0) || 1;
   }
@@ -4876,6 +5386,7 @@
           schemaVersion: 1,
           updatedAt: stored.updatedAt || null,
           setSignature: stored.setSignature || null,
+          analysisSeedBase: Number.isFinite(Number(stored.analysisSeedBase)) ? Number(stored.analysisSeedBase) : null,
           playerProfile: stored.playerProfile && typeof stored.playerProfile === "object" ? { ...stored.playerProfile } : null,
           opponents: stored.opponents && typeof stored.opponents === "object" ? { ...stored.opponents } : {}
         };
@@ -4912,6 +5423,7 @@
       if (roster.length !== 5) return { ok: false, reason: "own-team-count", error: `Circus Provinciarum requires exactly 5 saved Circus fighters (dolls 2–6); found ${roster.length}.` };
       const ownTeam = roster.map(profile => buildSavedCircusFighterProfile(engine, profile));
       if (ownTeam.length !== 5) return { ok: false, reason: "own-team-build", error: `Could not build a complete 5-fighter Circus team; built ${ownTeam.length}.` };
+      const teamFingerprint = circusTeamSimulationFingerprint(roster);
 
       logAutoCombatDiagnostic("provinciarum-analysis-start", {
         format: "5v5",
@@ -4922,6 +5434,7 @@
       });
 
       const setSignature = circusProvinciarumAnalysisSetSignature(opponents);
+      const analysisSeedBase = newSimulationSeedBase();
       const results = {};
       let failures = 0;
       const count = circusProvinciarumSimulationCount();
@@ -4979,7 +5492,7 @@
             criticalHealing: Number.isFinite(Number(fighter.criticalHealingValue)) ? Number(fighter.criticalHealingValue) : 0,
             turmaThreat: Number.isFinite(Number(fighter.threat)) ? Number(fighter.threat) : 0
           }));
-          const seed = circusProvinciarumSimulationSeedForOpponent(opponent);
+          const seed = circusProvinciarumSimulationSeedForOpponent(opponent, analysisSeedBase);
           const simulation = await withArenaAnalysisTimeout(engine.simulateTurmaBatchAsync({
             attackers: ownTeam,
             defenders: opponentTeam,
@@ -4995,6 +5508,7 @@
             key: opponent.key, name: opponent.name, playerId: opponent.playerId, province: opponent.province, level: opponent.level,
             ok: true, format: "5v5", profileDollIds: opponentTeam.map(f => f.dollId), excludedDollIds: ["1"],
             team: opponentTeam,
+            teamFingerprint,
             simulations: Number(simulation?.simulations || count), maxRounds: CIRCUS_PROVINCIARUM_SIMULATION_ROUNDS, seed,
             current: {
               winRate,
@@ -5036,8 +5550,10 @@
         schemaVersion: 1,
         updatedAt: new Date().toISOString(),
         setSignature,
+        analysisSeedBase,
         playerProfile: {
           format: "5v5",
+          simulationFingerprint: teamFingerprint,
           excludedArenaCharacterDoll: "1",
           ownTeam: ownTeam.map(f => ({ name: f.name, dollId: f.dollId, level: f.level, lifeMax: f.lifeMax, turmaRole: f.turmaRole }))
         },
@@ -5073,13 +5589,29 @@
     }
   }
 
-  function circusProvinciarumAnalysisCacheIsCurrent(opponents) {
+  function currentCircusTeamFingerprint() {
+    const roster = turmaCharacterProfilesList()
+      .slice()
+      .sort((a, b) => Number(a.dollId) - Number(b.dollId));
+    if (roster.length !== 5) return null;
+    if (roster.some(profile => characterProfileMissingSimulationData(profile).length)) return null;
+    return circusTeamSimulationFingerprint(roster);
+  }
+
+  function circusProvinciarumAnalysisCacheIsCurrent(opponents, context = null) {
     if (!Array.isArray(opponents) || opponents.length !== 5) return false;
     if (circusProvinciarumAnalysisStore?.setSignature !== circusProvinciarumAnalysisSetSignature(opponents)) return false;
     const simulations = circusProvinciarumSimulationCount();
+    const updatedAtMs = Date.parse(String(circusProvinciarumAnalysisStore?.updatedAt || ""));
+    if (!Number.isFinite(updatedAtMs) || Date.now() - updatedAtMs > CIRCUS_ANALYSIS_CACHE_MAX_AGE_MS) return false;
+    const teamFingerprint = context?.teamFingerprint || null;
+    if (teamFingerprint && String(circusProvinciarumAnalysisStore?.playerProfile?.simulationFingerprint || "") !== String(teamFingerprint)) return false;
     return opponents.every(op => {
       const result = circusProvinciarumAnalysisStore?.opponents?.[op.key];
-      return result?.ok === true && Number(result.simulations) === simulations && Number.isFinite(Number(result.current?.winRate));
+      if (result?.ok === true) return Number(result.simulations) === simulations
+        && Number.isFinite(Number(result.current?.winRate))
+        && (!teamFingerprint || String(result.teamFingerprint || "") === String(teamFingerprint));
+      return result?.unavailable === true && typeof result.error === "string" && !!result.error;
     });
   }
 
@@ -5101,16 +5633,19 @@
     if (circusProvinciarumAnalysisPromise) return circusProvinciarumAnalysisPromise;
 
     circusProvinciarumAnalysisPromise = (async () => {
+      await loadCharacterProfileStore();
+      const teamFingerprint = currentCircusTeamFingerprint();
       await loadCircusProvinciarumAnalysisStore();
-      if (circusProvinciarumAnalysisCacheIsCurrent(opponents)) {
+      if (teamFingerprint && circusProvinciarumAnalysisCacheIsCurrent(opponents, { teamFingerprint })) {
         renderNativeOpponentWinRateBadges();
+        const values = Object.values(circusProvinciarumAnalysisStore.opponents || {});
         return {
           ok: true,
           reused: true,
           reason: "cached",
-          completed: opponents.length,
+          completed: values.filter(x => x?.ok).length,
           total: opponents.length,
-          failures: 0,
+          failures: values.filter(x => !x?.ok).length,
           setSignature: circusProvinciarumAnalysisStore.setSignature,
           results: circusProvinciarumAnalysisStore.opponents,
           playerProfile: circusProvinciarumAnalysisStore.playerProfile
@@ -5131,10 +5666,12 @@
   }
 
   function chooseCircusProvinciarumTarget() {
+    const threshold = minimumOpponentWinRateThresholdPercent();
     const candidates = parseCircusProvinciarumOpponents().filter(opponent => !circusProvinciarumOpponentIsAttempted(opponent));
     const analyzed = candidates
       .map(opponent => ({ opponent, analysis: circusProvinciarumAnalysisStore?.opponents?.[opponent.key] || null }))
-      .filter(row => row.analysis?.ok && Number.isFinite(Number(row.analysis?.current?.winRate)));
+      .filter(row => row.analysis?.ok && Number.isFinite(Number(row.analysis?.current?.winRate))
+        && (threshold <= 0 || Number(row.analysis.current.winRate) >= threshold));
     if (!analyzed.length) return null;
     analyzed.sort((a, b) => {
       const aw = Number(a.analysis.current.winRate);
@@ -5258,17 +5795,22 @@
       const result = await storageGet(circusProvinciarumAutomationKey());
       const stored = result?.[circusProvinciarumAutomationKey()];
       if (stored && typeof stored === "object") {
+        const recoverKnownError = !stored.enabled && stored.phase === "error" && /confirmation did not appear|Could not capture any usable Circus Provinciarum opponent/i.test(String(stored.error || ""));
         circusProvinciarumAutomationState = {
-          enabled: !!stored.enabled,
+          enabled: !!stored.enabled || recoverKnownError,
           maxRuns: Math.max(1, Math.min(CIRCUS_PROVINCIARUM_MAX_RUNS, Number(stored.maxRuns) || 100)),
           completedRuns: Math.max(0, Number(stored.completedRuns) || 0),
           opponentSearches: Math.max(0, Number(stored.opponentSearches) || 0),
-          bestObservedWinRate: Number.isFinite(Number(stored.bestObservedWinRate)) ? Number(stored.bestObservedWinRate) : null,
+          bestObservedWinRate: ((Number(stored.opponentSearches) || 0) === 0 && (Number(stored.completedRuns) || 0) === 0 && !stored.lastBattle) ? null : (Number.isFinite(Number(stored.bestObservedWinRate)) ? Number(stored.bestObservedWinRate) : null),
           lastBattle: stored.lastBattle && typeof stored.lastBattle === "object" ? { ...stored.lastBattle } : null,
           attemptedOpponents: stored.attemptedOpponents && typeof stored.attemptedOpponents === "object" ? { ...stored.attemptedOpponents } : {},
           unavailableOpponents: stored.unavailableOpponents && typeof stored.unavailableOpponents === "object" ? { ...stored.unavailableOpponents } : {},
           pendingTargetKey: stored.pendingTargetKey ? String(stored.pendingTargetKey) : null,
           pendingTargetName: normalize(stored.pendingTargetName || ""),
+          confirmationRetryCount: Math.max(0, Number(stored.confirmationRetryCount) || 0),
+          confirmationRetryTargetKey: stored.confirmationRetryTargetKey ? String(stored.confirmationRetryTargetKey) : null,
+          refreshHandoffPending: stored.refreshHandoffPending === true,
+          refreshHandoffStartedAt: Number.isFinite(Number(stored.refreshHandoffStartedAt)) ? Number(stored.refreshHandoffStartedAt) : null,
           pendingReportId: stored.pendingReportId ? String(stored.pendingReportId) : null,
           lastProcessedReportId: stored.lastProcessedReportId
             ? String(stored.lastProcessedReportId)
@@ -5278,9 +5820,9 @@
           reportWaitAttempts: Math.max(0, Number(stored.reportWaitAttempts) || 0),
           readiness: stored.readiness === "ready" || stored.readiness === "cooling" ? stored.readiness : "unknown",
           readyAt: Number.isFinite(Number(stored.readyAt)) ? Number(stored.readyAt) : null,
-          phase: stored.phase || "stopped",
+          phase: recoverKnownError ? "queued" : (stored.phase || "stopped"),
           startedAt: stored.startedAt || null,
-          error: stored.error || null
+          error: recoverKnownError ? null : (stored.error || null)
         };
         return circusProvinciarumAutomationState;
       }
@@ -5289,6 +5831,7 @@
       enabled: false, maxRuns: 100, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {}, unavailableOpponents: {},
       pendingTargetKey: null, pendingTargetName: "", pendingReportId: null, lastProcessedReportId: null,
       reportWaitReportId: null, reportWaitStartedAt: null, reportWaitAttempts: 0,
+      confirmationRetryCount: 0, confirmationRetryTargetKey: null,
       readiness: "unknown", readyAt: null, phase: "stopped", startedAt: null, error: null
     };
     return circusProvinciarumAutomationState;
@@ -5398,10 +5941,27 @@
     return false;
   }
 
+  function findCircusOpponentRefreshControl() {
+    const form = document.querySelector('form[name="filterForm"][action*="getNewOpponents"][action*="aType=3"]');
+    if (!form) return null;
+    return form.querySelector('input[type="submit"][name="actionButton"]')
+      || form.querySelector('button[type="submit"]')
+      || form.querySelector('input[type="submit"]')
+      || form.querySelector('button[name="actionButton"]')
+      || null;
+  }
+
   async function requestNewCircusProvinciarumOpponents(reason = null) {
     const form = document.querySelector('form[name="filterForm"][action*="getNewOpponents"][action*="aType=3"]');
-    const submit = form?.querySelector('input[type="submit"][name="actionButton"]') || form?.querySelector("input[type=submit]");
-    if (!form || !submit) return false;
+    const submit = findCircusOpponentRefreshControl();
+    if (!form || !submit) {
+      logAutoCombatDiagnostic("provinciarum-opponent-refresh-control-missing", {
+        reason: reason || null,
+        url: location.href,
+        page: document.body?.id || null
+      });
+      return false;
+    }
     const currentCooldownMs = circusProvinciarumCooldownMs();
     if (Number.isFinite(currentCooldownMs) && currentCooldownMs > 0) {
       circusProvinciarumAutomationState.phase = "waiting-cooldown";
@@ -5415,6 +5975,8 @@
     }
     circusProvinciarumAutomationState.phase = "refreshing";
     circusProvinciarumAutomationState.error = reason || "All five visible Provinciarum opponents have already been attempted; requesting a fresh opponent set.";
+    circusProvinciarumAutomationState.refreshHandoffPending = true;
+    circusProvinciarumAutomationState.refreshHandoffStartedAt = Date.now();
     await saveCircusProvinciarumAutomationState();
     renderAutoCombatUI();
     stopCircusProvinciarumAutomationTimer();
@@ -5431,6 +5993,8 @@
     }
     if (!clicked) {
       circusProvinciarumAutomationState.opponentSearches = previousSearches;
+      circusProvinciarumAutomationState.refreshHandoffPending = false;
+      circusProvinciarumAutomationState.refreshHandoffStartedAt = null;
       circusProvinciarumAutomationState.phase = "checking";
       circusProvinciarumAutomationState.error = "Circus Provinciarum Search control disappeared before the click could be performed; retrying.";
       await saveCircusProvinciarumAutomationState();
@@ -5439,6 +6003,8 @@
       return false;
     }
     circusProvinciarumAutomationState.unavailableOpponents = {};
+    circusProvinciarumAutomationState.confirmationRetryCount = 0;
+    circusProvinciarumAutomationState.confirmationRetryTargetKey = null;
     await saveCircusProvinciarumAutomationState();
     logAutoCombatDiagnostic("provinciarum-opponent-refresh-cleared-unavailable", {});
     return true;
@@ -5449,6 +6015,8 @@
     releaseAutomationNavigation("provinciarum");
     circusProvinciarumAutomationState = circusProvinciarumAutomationState || await loadCircusProvinciarumAutomationState();
     circusProvinciarumAutomationState.enabled = false;
+    circusProvinciarumAutomationState.refreshHandoffPending = false;
+    circusProvinciarumAutomationState.refreshHandoffStartedAt = null;
     circusProvinciarumAutomationState.phase = "stopped";
     circusProvinciarumAutomationState.error = null;
     circusProvinciarumAutomationState.readiness = "unknown";
@@ -5457,6 +6025,8 @@
     circusProvinciarumAutomationState.reportWaitReportId = null;
     circusProvinciarumAutomationState.reportWaitStartedAt = null;
     circusProvinciarumAutomationState.reportWaitAttempts = 0;
+    circusProvinciarumAutomationState.confirmationRetryCount = 0;
+    circusProvinciarumAutomationState.confirmationRetryTargetKey = null;
     await saveCircusProvinciarumAutomationState();
     renderAutoCombatUI();
     if (!autoCombatEnabledModules().length) { stopAutoCombatDispatcherTimer(); stopAutoCombatCooldownObserver(); }
@@ -5474,6 +6044,8 @@
       circusProvinciarumAutomationState = {
         enabled: true, maxRuns, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {}, unavailableOpponents: {}, pendingTargetKey: null, pendingTargetName: "", pendingReportId: null, lastProcessedReportId: null,
         reportWaitReportId: null, reportWaitStartedAt: null, reportWaitAttempts: 0,
+        confirmationRetryCount: 0, confirmationRetryTargetKey: null,
+        refreshHandoffPending: false, refreshHandoffStartedAt: null,
         readiness: "unknown", readyAt: null, phase: "starting", startedAt: new Date().toISOString(), error: null
       };
       await saveCircusProvinciarumAutomationState();
@@ -5520,6 +6092,15 @@
     const postBattleDecision = buildAutoCombatPostBattleDecision("provinciarum", id, circusProvinciarumAutomationState.completedRuns, circusProvinciarumAutomationState.maxRuns);
     circusProvinciarumAutomationState.lastBattle = postBattleDecision;
     logAutoCombatDiagnostic("provinciarum-post-battle-decision", postBattleDecision);
+    const matchedCircusTargetKey = circusProvinciarumAutomationState.pendingTargetKey || null;
+    const predictedCircusWinRate = matchedCircusTargetKey ? Number(circusProvinciarumAnalysisStore?.opponents?.[matchedCircusTargetKey]?.current?.winRate) : NaN;
+    if (Number.isFinite(predictedCircusWinRate) && ((postBattleDecision.result === "Loss" && predictedCircusWinRate >= 80) || (postBattleDecision.result === "Win" && predictedCircusWinRate <= 20))) {
+      logAutoCombatDiagnostic("provinciarum-prediction-mismatch", {
+        target: postBattleDecision.opponent, targetKey: matchedCircusTargetKey, predictedWinRate: predictedCircusWinRate,
+        actualResult: postBattleDecision.result, reportId: id, simulations: circusProvinciarumAnalysisStore?.opponents?.[matchedCircusTargetKey]?.simulations || null,
+        seed: circusProvinciarumAnalysisStore?.opponents?.[matchedCircusTargetKey]?.seed || null, teamFingerprint: circusProvinciarumAnalysisStore?.opponents?.[matchedCircusTargetKey]?.teamFingerprint || null
+      });
+    }
     circusProvinciarumAutomationState.pendingTargetKey = null;
     circusProvinciarumAutomationState.pendingTargetName = "";
     if (circusProvinciarumAutomationState.completedRuns >= circusProvinciarumAutomationState.maxRuns) {
@@ -5592,6 +6173,63 @@
   async function resumeCircusProvinciarumAutomation({ allowBusy = false } = {}) {
     if ((circusProvinciarumAutomationBusy && !allowBusy) || !circusProvinciarumAutomationState?.enabled) return;
     logAutoCombatDiagnostic("provinciarum-resume", { reason: allowBusy ? "scheduler" : "direct" });
+
+    const liveCircusCooldownMs = circusProvinciarumCooldownMs();
+    if (circusProvinciarumAutomationState.phase === "refreshing"
+      && circusProvinciarumAutomationState.refreshHandoffPending
+      && isCircusProvinciarumOpponentRefreshPage()) {
+      const refreshWaitStartedAt = Number(circusProvinciarumAutomationState.refreshHandoffStartedAt) || Date.now();
+      const refreshWaitElapsedMs = Math.max(0, Date.now() - refreshWaitStartedAt);
+      if (Number.isFinite(liveCircusCooldownMs) && liveCircusCooldownMs > 0) {
+        circusProvinciarumAutomationState.phase = "waiting-cooldown";
+        circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(liveCircusCooldownMs)}.`;
+        circusProvinciarumAutomationState.refreshHandoffPending = false;
+        circusProvinciarumAutomationState.refreshHandoffStartedAt = null;
+        setModuleReadiness("provinciarum", liveCircusCooldownMs);
+        releaseAutomationNavigation("provinciarum");
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("provinciarum-refresh-accepted-direct-handoff", {
+          cooldownMs: liveCircusCooldownMs,
+          page: location.href,
+          nextAction: "shared-dispatcher"
+        });
+        scheduleAutoCombatResume(0, "provinciarum-refresh-complete-handoff");
+        return;
+      }
+      // A successful in-page refresh can briefly render the new opponent list
+      // before Gladiatus has painted the newly-started Circus cooldown. Never
+      // analyze that list during this settling window: doing so keeps the
+      // scheduler inside Circus and can leave Arena stuck in `starting`.
+      circusProvinciarumAutomationState.phase = "waiting-other";
+      circusProvinciarumAutomationState.error = `Circus Provinciarum refresh accepted; waiting for cooldown state (${Math.ceil(Math.max(0, 5000 - refreshWaitElapsedMs) / 1000)}s).`;
+      releaseAutomationNavigation("provinciarum");
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-refresh-settling", {
+        cooldownMs: Number.isFinite(liveCircusCooldownMs) ? liveCircusCooldownMs : null,
+        elapsedMs: refreshWaitElapsedMs,
+        handoffPending: true,
+        nextAction: "shared-dispatcher"
+      });
+      scheduleAutoCombatResume(refreshWaitElapsedMs >= 5000 ? 0 : 350, "provinciarum-refresh-settling");
+      return;
+    }
+
+    if (Number.isFinite(liveCircusCooldownMs) && liveCircusCooldownMs > 0) {
+      if (["queued", "checking", "refreshing", "confirming", "humanizing", "navigating"].includes(circusProvinciarumAutomationState.phase)) {
+        circusProvinciarumAutomationState.pendingTargetKey = null;
+        circusProvinciarumAutomationState.pendingTargetName = "";
+      }
+      circusProvinciarumAutomationState.phase = "waiting-cooldown";
+      circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(liveCircusCooldownMs)}.`;
+      setModuleReadiness("provinciarum", liveCircusCooldownMs);
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-resume-blocked-cooldown", { cooldownMs: liveCircusCooldownMs });
+      scheduleAutoCombatResume(Math.max(25, liveCircusCooldownMs + 25), "provinciarum-resume-cooldown");
+      return;
+    }
 
     if (circusProvinciarumAutomationState.completedRuns >= circusProvinciarumAutomationState.maxRuns) {
       circusProvinciarumAutomationState.enabled = false;
@@ -5782,13 +6420,22 @@
         return;
       }
       if (refreshCooldownMs > 0) {
+        // The game's in-page opponent refresh has completed: the newly-started
+        // Circus cooldown is the authoritative signal that the refresh action
+        // was accepted. Do not keep the scheduler blocked on Circus until that
+        // cooldown expires. Hand control back immediately so another ready
+        // module (notably Arena) can be selected.
         circusProvinciarumAutomationState.phase = "waiting-cooldown";
         circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(refreshCooldownMs)}.`;
         setModuleReadiness("provinciarum", refreshCooldownMs);
+        releaseAutomationNavigation("provinciarum");
         await saveCircusProvinciarumAutomationState();
         renderAutoCombatUI();
-        logAutoCombatDiagnostic("provinciarum-opponent-refresh-cooldown-detected", { cooldownMs: refreshCooldownMs });
-        scheduleAutoCombatResume(Math.max(25, refreshCooldownMs + 25), "provinciarum-refresh-cooldown");
+        logAutoCombatDiagnostic("provinciarum-opponent-refresh-cooldown-detected", {
+          cooldownMs: refreshCooldownMs,
+          handoff: "shared-dispatcher"
+        });
+        scheduleAutoCombatResume(0, "provinciarum-refresh-complete-handoff");
         return;
       }
       const refreshedOpponents = parseCircusProvinciarumOpponents();
@@ -5835,14 +6482,14 @@
         });
         return;
       }
-      circusProvinciarumAutomationState.enabled = false;
-      circusProvinciarumAutomationState.phase = "error";
+      circusProvinciarumAutomationState.phase = "checking";
       circusProvinciarumAutomationState.pendingTargetKey = null;
       circusProvinciarumAutomationState.pendingTargetName = "";
-      circusProvinciarumAutomationState.error = analysis?.error || "Could not capture any usable Circus Provinciarum opponent and a fresh opponent set could not be requested.";
+      circusProvinciarumAutomationState.error = analysis?.error || "No usable Circus Provinciarum opponent was captured; waiting to retry the opponent page.";
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("provinciarum-analysis-blocked", { reason: analysis?.reason || null, error: circusProvinciarumAutomationState.error });
+      logAutoCombatDiagnostic("provinciarum-analysis-retry-state", { reason: analysis?.reason || null, error: circusProvinciarumAutomationState.error });
+      scheduleAutoCombatResume(1000, "provinciarum-analysis-retry");
       return;
     }
 
@@ -5862,14 +6509,17 @@
         logAutoCombatDiagnostic("provinciarum-win-rate-safeguard-triggered", circusLowWinRateSafeguard);
         return;
       }
-      circusProvinciarumAutomationState.enabled = false;
-      circusProvinciarumAutomationState.phase = "error";
+      circusProvinciarumAutomationState.phase = "checking";
       circusProvinciarumAutomationState.pendingTargetKey = null;
       circusProvinciarumAutomationState.pendingTargetName = "";
-      circusProvinciarumAutomationState.error = "The minimum Circus opponent win-rate safeguard triggered, but the Search for opponents control could not be clicked.";
+      circusProvinciarumAutomationState.error = "Waiting for the Circus Provinciarum Search for opponents control after the minimum win-rate safeguard.";
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("provinciarum-win-rate-safeguard-search-failed", circusLowWinRateSafeguard);
+      logAutoCombatDiagnostic("provinciarum-win-rate-safeguard-refresh-retry", {
+        ...circusLowWinRateSafeguard,
+        reason: "refresh-control-unavailable"
+      });
+      scheduleAutoCombatResume(750, "provinciarum-win-rate-safeguard-refresh-retry");
       return;
     }
 
@@ -5880,12 +6530,40 @@
       visibleOpponents: parseCircusProvinciarumOpponents().map(opponent => ({ key: opponent.key, name: opponent.name, level: opponent.level, province: opponent.province, playerId: opponent.playerId, attempted: circusProvinciarumOpponentIsAttempted(opponent), winRate: circusProvinciarumAnalysisStore?.opponents?.[opponent.key]?.current?.winRate ?? null }))
     });
     if (!target) {
-      if (await requestNewCircusProvinciarumOpponents()) return;
-      circusProvinciarumAutomationState.enabled = false;
-      circusProvinciarumAutomationState.phase = "error";
-      circusProvinciarumAutomationState.error = "No unattempted Circus Provinciarum opponent is available and the Search for opponents control could not be found.";
+      if (await requestNewCircusProvinciarumOpponents("No usable unattempted Circus Provinciarum opponent remains; requesting a fresh opponent set.")) return;
+      circusProvinciarumAutomationState.phase = "checking";
+      circusProvinciarumAutomationState.error = "No usable unattempted Circus Provinciarum opponent is available; waiting to retry the live opponent page.";
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-target-retry-state", { reason: "no-target-and-refresh-unavailable" });
+      scheduleAutoCombatResume(1000, "provinciarum-target-retry");
+      return;
+    }
+
+    const targetWinRate = Number(circusProvinciarumAnalysisStore?.opponents?.[target.key]?.current?.winRate);
+    const targetThreshold = minimumOpponentWinRateThresholdPercent();
+    if (targetThreshold > 0 && (!Number.isFinite(targetWinRate) || targetWinRate < targetThreshold)) {
+      logAutoCombatDiagnostic("provinciarum-target-blocked-win-rate", { target: target.name, winRate: Number.isFinite(targetWinRate) ? targetWinRate : null, threshold: targetThreshold });
+      circusProvinciarumAutomationState.pendingTargetKey = null;
+      circusProvinciarumAutomationState.pendingTargetName = "";
+      circusProvinciarumAutomationState.phase = "queued";
+      circusProvinciarumAutomationState.error = `Selected Circus Provinciarum opponent did not meet the ${targetThreshold}% minimum win-rate threshold; refreshing before any attack.`;
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      await requestNewCircusProvinciarumOpponents(circusProvinciarumAutomationState.error);
+      return;
+    }
+    const preTargetClickCooldownMs = circusProvinciarumCooldownMs();
+    if (Number.isFinite(preTargetClickCooldownMs) && preTargetClickCooldownMs > 0) {
+      circusProvinciarumAutomationState.pendingTargetKey = null;
+      circusProvinciarumAutomationState.pendingTargetName = "";
+      circusProvinciarumAutomationState.phase = "waiting-cooldown";
+      circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(preTargetClickCooldownMs)}.`;
+      setModuleReadiness("provinciarum", preTargetClickCooldownMs);
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-target-blocked-cooldown", { cooldownMs: preTargetClickCooldownMs, target: target.name });
+      scheduleAutoCombatResume(Math.max(25, preTargetClickCooldownMs + 25), "provinciarum-target-cooldown");
       return;
     }
 
@@ -5893,10 +6571,20 @@
     circusProvinciarumAutomationState.pendingTargetName = target.name;
     circusProvinciarumAutomationState.phase = "confirming";
     circusProvinciarumAutomationState.error = null;
+    const cooldownBeforeClickMs = circusProvinciarumCooldownMs();
     await saveCircusProvinciarumAutomationState();
     renderAutoCombatUI();
 
-    const opponentClicked = await humanizedClick(target.button, "provinciarum-opponent", { beforeClick: () => ensureAutoCombatHpSafety("provinciarum", "opponent-click") });
+    const opponentClicked = await humanizedClick(target.button, "provinciarum-opponent", {
+      beforeClick: async () => {
+        const cooldown = circusProvinciarumCooldownMs();
+        if (Number.isFinite(cooldown) && cooldown > 0) {
+          logAutoCombatDiagnostic("provinciarum-click-guard-cooldown", { target: target.name, cooldownMs: cooldown });
+          return false;
+        }
+        return ensureAutoCombatHpSafety("provinciarum", "opponent-click");
+      }
+    });
     logAutoCombatDiagnostic("provinciarum-click-opponent-result", { clicked: opponentClicked, target: target.name });
     if (!opponentClicked || !circusProvinciarumAutomationState?.enabled) {
       if (autoHealingState?.active) {
@@ -5909,25 +6597,119 @@
         scheduleAutoCombatResume(0, "provinciarum-waiting-healing");
         return;
       }
+      const failedClickCooldownMs = circusProvinciarumCooldownMs();
+      if (Number.isFinite(failedClickCooldownMs) && failedClickCooldownMs > 0) {
+        circusProvinciarumAutomationState.phase = "waiting-report";
+        circusProvinciarumAutomationState.error = "Circus Provinciarum cooldown started during the click delay; treating the attack as started and refusing a retry click.";
+        markTargetAttempted();
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("provinciarum-click-blocked-after-cooldown-start", { target: target.name, cooldownMs: failedClickCooldownMs });
+        scheduleAutoCombatResume(350, "provinciarum-click-blocked-after-cooldown-start");
+        return;
+      }
       circusProvinciarumAutomationState.phase = "error";
       circusProvinciarumAutomationState.error = "Circus Provinciarum opponent control disappeared before the click could be performed.";
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
       return;
     }
-    circusProvinciarumAutomationState.attemptedOpponents[target.key] = {
-      name: target.name, level: target.level, province: target.province, playerId: target.playerId, profileHost: target.profileHost, attemptedAt: new Date().toISOString()
-    };
-    await saveCircusProvinciarumAutomationState();
+    if (circusProvinciarumAutomationState.confirmationRetryTargetKey !== target.key) {
+      circusProvinciarumAutomationState.confirmationRetryTargetKey = target.key;
+      circusProvinciarumAutomationState.confirmationRetryCount = 0;
+    }
 
-    const confirmButton = await waitForArenaConfirmation();
-    logAutoCombatDiagnostic("provinciarum-confirmation-detected", { found: !!confirmButton });
-    if (!confirmButton || !circusProvinciarumAutomationState?.enabled) {
-      circusProvinciarumAutomationState.enabled = false;
-      circusProvinciarumAutomationState.phase = "error";
-      circusProvinciarumAutomationState.error = "Circus Provinciarum attack confirmation did not appear; automation stopped without retrying the opponent.";
+    const markTargetAttempted = () => {
+      circusProvinciarumAutomationState.attemptedOpponents[target.key] = {
+        name: target.name, level: target.level, province: target.province, playerId: target.playerId, profileHost: target.profileHost, attemptedAt: new Date().toISOString()
+      };
+    };
+
+    const confirmState = await waitForCircusProvinciarumConfirmation({ cooldownBeforeClickMs });
+    logAutoCombatDiagnostic("provinciarum-confirmation-detected", {
+      found: confirmState.kind === "confirmation",
+      kind: confirmState.kind,
+      reportId: confirmState.reportId || null,
+      cooldownMs: confirmState.cooldownMs || null,
+      elapsedMs: confirmState.elapsedMs
+    });
+
+    if (!circusProvinciarumAutomationState?.enabled) return;
+
+    if (confirmState.kind === "report" && confirmState.reportId) {
+      markTargetAttempted();
+      circusProvinciarumAutomationState.confirmationRetryCount = 0;
+      circusProvinciarumAutomationState.confirmationRetryTargetKey = null;
+      circusProvinciarumAutomationState.phase = "waiting-report";
+      circusProvinciarumAutomationState.error = null;
+      circusProvinciarumAutomationState.pendingReportId = String(confirmState.reportId);
       await saveCircusProvinciarumAutomationState();
       renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-report-transition-after-opponent", { target: target.name, reportId: String(confirmState.reportId) });
+      scheduleAutoCombatResume(150, "provinciarum-report-transition-detected");
+      return;
+    }
+
+    if (confirmState.kind === "cooldown") {
+      markTargetAttempted();
+      circusProvinciarumAutomationState.confirmationRetryCount = 0;
+      circusProvinciarumAutomationState.confirmationRetryTargetKey = null;
+      circusProvinciarumAutomationState.phase = "waiting-report";
+      circusProvinciarumAutomationState.error = "Circus Provinciarum attack started; the confirmation dialog was not visible before the fight cooldown began.";
+      setModuleReadiness("provinciarum", null);
+      await saveCircusProvinciarumAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("provinciarum-attack-started-without-visible-confirmation", { target: target.name, cooldownMs: confirmState.cooldownMs });
+      scheduleAutoCombatResume(350, "provinciarum-attack-started-without-confirmation");
+      return;
+    }
+
+    const handleConfirmationFailure = async (reason, extra = {}) => {
+      const state = circusProvinciarumAutomationState;
+      if (!state?.enabled) return;
+      const previousCount = state.confirmationRetryTargetKey === target.key ? (Number(state.confirmationRetryCount) || 0) : 0;
+      const nextCount = previousCount + 1;
+      state.confirmationRetryTargetKey = target.key;
+      state.confirmationRetryCount = nextCount;
+      // The opponent is only considered attempted after Gladiatus accepts the
+      // actual Go!/confirmation click. A missing/vanished confirmation must
+      // therefore leave this opponent eligible for a retry.
+      delete state.attemptedOpponents[target.key];
+      state.pendingTargetKey = null;
+      state.pendingTargetName = "";
+
+      if (nextCount <= CIRCUS_CONFIRMATION_RETRY_LIMIT) {
+        state.phase = "queued";
+        state.error = `Circus Provinciarum confirmation was not completed; retrying the opponent (${nextCount}/${CIRCUS_CONFIRMATION_RETRY_LIMIT}).`;
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("provinciarum-confirmation-retry", {
+          target: target.name, retryCount: nextCount, retryLimit: CIRCUS_CONFIRMATION_RETRY_LIMIT, reason, ...extra
+        });
+        scheduleAutoCombatResume(CIRCUS_CONFIRMATION_RETRY_DELAY_MS, "provinciarum-confirmation-retry");
+        return;
+      }
+
+      state.confirmationRetryCount = 0;
+      state.confirmationRetryTargetKey = null;
+      await saveCircusProvinciarumAutomationState();
+      const refreshed = await requestNewCircusProvinciarumOpponents(
+        `Circus Provinciarum confirmation failed ${CIRCUS_CONFIRMATION_RETRY_LIMIT} times; requesting a fresh opponent set.`
+      );
+      if (!refreshed) {
+        state.phase = "checking";
+        state.error = "Circus Provinciarum confirmation could not be completed; waiting to retry the live opponent page.";
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("provinciarum-confirmation-refresh-fallback", {
+          target: target.name, reason, ...extra
+        });
+        scheduleAutoCombatResume(1000, "provinciarum-confirmation-refresh-fallback");
+      }
+    };
+
+    if (confirmState.kind !== "confirmation") {
+      await handleConfirmationFailure("confirmation-timeout", { timeoutMs: CIRCUS_CONFIRMATION_TIMEOUT_MS, elapsedMs: confirmState.elapsedMs });
       return;
     }
 
@@ -5936,16 +6718,25 @@
     setModuleReadiness("provinciarum", null);
     await saveCircusProvinciarumAutomationState();
     renderAutoCombatUI();
-    const confirmed = await humanizedClick(confirmButton, "provinciarum-confirm");
-    logAutoCombatDiagnostic("provinciarum-click-confirm-result", { clicked: confirmed });
+    const confirmed = await humanizedClick(confirmState.button, "provinciarum-confirm", {
+      beforeClick: async () => {
+        const cooldown = circusProvinciarumCooldownMs();
+        if (Number.isFinite(cooldown) && cooldown > 0) {
+          logAutoCombatDiagnostic("provinciarum-confirm-guard-cooldown", { target: target.name, cooldownMs: cooldown });
+          return false;
+        }
+        return true;
+      }
+    });
+    logAutoCombatDiagnostic("provinciarum-click-confirm-result", { clicked: confirmed, target: target.name });
     if (!confirmed || !circusProvinciarumAutomationState?.enabled) {
-      circusProvinciarumAutomationState.enabled = false;
-      circusProvinciarumAutomationState.phase = "error";
-      circusProvinciarumAutomationState.error = "Circus Provinciarum confirmation disappeared before the click could be performed; automation stopped.";
-      await saveCircusProvinciarumAutomationState();
-      renderAutoCombatUI();
+      await handleConfirmationFailure("confirmation-click-failed");
       return;
     }
+
+    markTargetAttempted();
+    circusProvinciarumAutomationState.confirmationRetryCount = 0;
+    circusProvinciarumAutomationState.confirmationRetryTargetKey = null;
     circusProvinciarumAutomationState.phase = "waiting-report";
     await saveCircusProvinciarumAutomationState();
     renderAutoCombatUI();
@@ -6145,24 +6936,56 @@
     }, 0);
   }
 
-  function scheduleNativeOpponentWinRateAutoAnalysis() {
+  function scheduleNativeOpponentWinRateAutoAnalysis({ force = false } = {}) {
     if (!nativeOpponentWinRateAutoAnalysisReady) return;
-    if (!isProvinciarumArenaPage() && !isCircusProvinciarumPage()) return;
+    const arenaPage = isProvinciarumArenaPage();
+    const circusPage = isCircusProvinciarumPage();
+    if (!arenaPage && !circusPage) return;
+    const mode = circusPage ? "circus" : "arena";
     if (nativeOpponentWinRateAutoAnalysisTimer) return;
+    if (mode === "circus" && circusProvinciarumAnalysisBusy) return;
+    if (mode === "arena" && arenaAnalysisBusy) return;
+
+    const opponents = circusPage ? parseCircusProvinciarumOpponents() : parseArenaOpponents();
+    if (opponents.length !== 5) return;
+    const setSignature = circusPage
+      ? circusProvinciarumAnalysisSetSignature(opponents)
+      : arenaAnalysisSetSignature(opponents);
+
+    // ChildList mutations are extremely frequent on Gladiatus pages, including
+    // mutations caused by our own badge rendering. Only analyze automatically
+    // when the actual five-opponent set changes, unless explicitly forced by
+    // initialization/settings changes.
+    if (!force && nativeOpponentWinRateObservedSetSignature[mode] === setSignature) return;
+
     nativeOpponentWinRateAutoAnalysisTimer = setTimeout(() => {
       nativeOpponentWinRateAutoAnalysisTimer = null;
       void (async () => {
         try {
           if (isProvinciarumArenaPage()) {
-            const opponents = parseArenaOpponents();
-            if (opponents.length !== 5) return;
+            const currentOpponents = parseArenaOpponents();
+            if (currentOpponents.length !== 5) return;
+            const currentSignature = arenaAnalysisSetSignature(currentOpponents);
+            if (!force && nativeOpponentWinRateObservedSetSignature.arena === currentSignature) return;
             const result = await analyzeCurrentArenaOpponents();
-            logAutoCombatDiagnostic(result?.reused ? "native-arena-winrate-cache-reused" : "native-arena-winrate-auto-analysis-complete", { ok: !!result?.ok, reused: !!result?.reused, completed: result?.completed || 0, total: result?.total || 0, simulations: arenaSimulationCount(), setSignature: result?.setSignature || null });
+            nativeOpponentWinRateObservedSetSignature.arena = result?.setSignature || currentSignature;
+            const signature = `${result?.setSignature || ""}|${result?.completed || 0}|${result?.total || 0}|${result?.failures || 0}|${result?.ok ? 1 : 0}|${result?.reused ? 1 : 0}`;
+            if (nativeWinrateLastLoggedSignature.arena !== signature) {
+              nativeWinrateLastLoggedSignature.arena = signature;
+              logAutoCombatDiagnostic(result?.reused ? "native-arena-winrate-cache-reused" : "native-arena-winrate-auto-analysis-complete", { ok: !!result?.ok, reused: !!result?.reused, completed: result?.completed || 0, total: result?.total || 0, failures: result?.failures || 0, simulations: arenaSimulationCount(), setSignature: result?.setSignature || null });
+            }
           } else if (isCircusProvinciarumPage()) {
-            const opponents = parseCircusProvinciarumOpponents();
-            if (opponents.length !== 5) return;
+            const currentOpponents = parseCircusProvinciarumOpponents();
+            if (currentOpponents.length !== 5) return;
+            const currentSignature = circusProvinciarumAnalysisSetSignature(currentOpponents);
+            if (!force && nativeOpponentWinRateObservedSetSignature.circus === currentSignature) return;
             const result = await analyzeCurrentCircusProvinciarumOpponents();
-            logAutoCombatDiagnostic(result?.reused ? "native-provinciarum-winrate-cache-reused" : "native-provinciarum-winrate-auto-analysis-complete", { ok: !!result?.ok, reused: !!result?.reused, completed: result?.completed || 0, total: result?.total || 0, simulations: circusProvinciarumSimulationCount(), setSignature: result?.setSignature || null });
+            nativeOpponentWinRateObservedSetSignature.circus = result?.setSignature || currentSignature;
+            const signature = `${result?.setSignature || ""}|${result?.completed || 0}|${result?.total || 0}|${result?.failures || 0}|${result?.ok ? 1 : 0}|${result?.reused ? 1 : 0}`;
+            if (nativeWinrateLastLoggedSignature.circus !== signature) {
+              nativeWinrateLastLoggedSignature.circus = signature;
+              logAutoCombatDiagnostic(result?.reused ? "native-provinciarum-winrate-cache-reused" : "native-provinciarum-winrate-auto-analysis-complete", { ok: !!result?.ok, reused: !!result?.reused, completed: result?.completed || 0, total: result?.total || 0, failures: result?.failures || 0, simulations: circusProvinciarumSimulationCount(), setSignature: result?.setSignature || null });
+            }
           }
         } catch (error) {
           logAutoCombatDiagnostic("native-winrate-auto-analysis-error", { mode: isCircusProvinciarumPage() ? "circus" : "arena", error: error?.message || String(error), stack: error?.stack || null });
@@ -6222,29 +7045,32 @@
       const result = await storageGet(arenaAutomationKey());
       const stored = result?.[arenaAutomationKey()];
       if (stored && typeof stored === "object") {
+        const recoverKnownError = !stored.enabled && stored.phase === "error" && /Could not capture and simulate every available Arena opponent|Arena attack confirmation did not appear|Arena confirmation disappeared before the click could be performed/i.test(String(stored.error || ""));
         arenaAutomationState = {
-          enabled: !!stored.enabled,
+          enabled: !!stored.enabled || recoverKnownError,
           maxRuns: Math.max(1, Math.min(ARENA_MAX_RUNS, Number(stored.maxRuns) || 100)),
           completedRuns: Math.max(0, Number(stored.completedRuns) || 0),
           opponentSearches: Math.max(0, Number(stored.opponentSearches) || 0),
-          bestObservedWinRate: Number.isFinite(Number(stored.bestObservedWinRate)) ? Number(stored.bestObservedWinRate) : null,
+          bestObservedWinRate: ((Number(stored.opponentSearches) || 0) === 0 && (Number(stored.completedRuns) || 0) === 0 && !stored.lastBattle) ? null : (Number.isFinite(Number(stored.bestObservedWinRate)) ? Number(stored.bestObservedWinRate) : null),
           lastBattle: stored.lastBattle && typeof stored.lastBattle === "object" ? { ...stored.lastBattle } : null,
           attemptedOpponents: stored.attemptedOpponents && typeof stored.attemptedOpponents === "object" ? { ...stored.attemptedOpponents } : {},
           pendingTargetKey: stored.pendingTargetKey ? String(stored.pendingTargetKey) : null,
           pendingTargetName: normalize(stored.pendingTargetName || ""),
+          confirmationRetryCount: Math.max(0, Number(stored.confirmationRetryCount) || 0),
+          confirmationRetryTargetKey: stored.confirmationRetryTargetKey ? String(stored.confirmationRetryTargetKey) : null,
           pendingReportId: stored.pendingReportId ? String(stored.pendingReportId) : null,
           readiness: stored.readiness === "ready" || stored.readiness === "cooling" ? stored.readiness : "unknown",
           readyAt: Number.isFinite(Number(stored.readyAt)) ? Number(stored.readyAt) : null,
-          phase: stored.phase || "stopped",
+          phase: recoverKnownError ? "queued" : (stored.phase || "stopped"),
           startedAt: stored.startedAt || null,
-          error: stored.error || null
+          error: recoverKnownError ? null : (stored.error || null)
         };
         return arenaAutomationState;
       }
     } catch (_) {}
     arenaAutomationState = {
       enabled: false, maxRuns: 100, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {},
-      pendingTargetKey: null, pendingTargetName: "", pendingReportId: null,
+      pendingTargetKey: null, pendingTargetName: "", confirmationRetryCount: 0, confirmationRetryTargetKey: null, pendingReportId: null,
       readiness: "unknown", readyAt: null,
       phase: "stopped", startedAt: null, error: null
     };
@@ -6386,22 +7212,28 @@
     const winRates = rows
       .filter(row => row.analysis?.ok && Number.isFinite(Number(row.analysis?.current?.winRate)))
       .map(row => Number(row.analysis.current.winRate));
-    const triggered = candidates.length > 0 && missing.length === 0 && winRates.every(rate => rate < threshold);
+    const triggered = winRates.length > 0 && winRates.every(rate => rate < threshold);
+    const eligibleCandidates = rows.filter(row => row.analysis?.ok && Number.isFinite(Number(row.analysis?.current?.winRate))
+      && Number(row.analysis.current.winRate) >= threshold);
     return {
       triggered,
       disabled: false,
       threshold,
       candidates: candidates.map(opponent => ({ key: opponent.key, name: opponent.name, index: opponent.index })),
+      analyzedCandidates: rows.filter(row => row.analysis?.ok && Number.isFinite(Number(row.analysis?.current?.winRate))).map(row => ({ key: row.opponent.key, name: row.opponent.name, index: row.opponent.index, winRate: Number(row.analysis.current.winRate) })),
+      eligibleCandidates: eligibleCandidates.map(row => ({ key: row.opponent.key, name: row.opponent.name, index: row.opponent.index, winRate: Number(row.analysis.current.winRate) })),
       winRates,
       missing: missing.map(row => ({ key: row.opponent.key, name: row.opponent.name, reason: row.analysis?.error || "win rate unavailable" }))
     };
   }
 
   function chooseArenaTarget() {
+    const threshold = minimumOpponentWinRateThresholdPercent();
     const candidates = parseArenaOpponents().filter(opponent => !arenaOpponentIsAttempted(opponent));
     const analyzed = candidates
       .map(opponent => ({ opponent, analysis: arenaOpponentAnalysisStore?.opponents?.[opponent.key] || null }))
-      .filter(row => row.analysis?.ok);
+      .filter(row => row.analysis?.ok && Number.isFinite(Number(row.analysis?.current?.winRate))
+        && (threshold <= 0 || Number(row.analysis.current.winRate) >= threshold));
     if (analyzed.length) {
       analyzed.sort((a, b) => {
         const aw = Number(a.analysis?.current?.winRate ?? -1);
@@ -6420,14 +7252,21 @@
     return null;
   }
 
-  async function waitForArenaConfirmation(timeoutMs = 9000) {
+  async function waitForArenaConfirmation({ timeoutMs = 9000, cooldownBeforeClickMs = null } = {}) {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
+      if (isCombatReportPage() && arenaReportDetection().isArena) {
+        return { kind: "report", reportId: reportIdFromUrl(), elapsedMs: Date.now() - started };
+      }
       const button = visibleArenaConfirmationButton();
-      if (button) return button;
+      if (button) return { kind: "confirmation", button, elapsedMs: Date.now() - started };
+      const cooldownNow = arenaCooldownMs();
+      if (Number.isFinite(cooldownBeforeClickMs) && cooldownBeforeClickMs <= 0 && Number.isFinite(cooldownNow) && cooldownNow > 0) {
+        return { kind: "cooldown", cooldownMs: cooldownNow, elapsedMs: Date.now() - started };
+      }
       await new Promise(resolve => setTimeout(resolve, 200));
     }
-    return null;
+    return { kind: "timeout", elapsedMs: Date.now() - started };
   }
 
   async function navigateToProvinciarumArena() {
@@ -6525,10 +7364,27 @@
     return false;
   }
 
+  function findArenaOpponentRefreshControl() {
+    const form = document.querySelector('form[name="filterForm"][action*="getNewOpponents"][action*="aType=2"]');
+    if (!form) return null;
+    return form.querySelector('input[type="submit"][name="actionButton"]')
+      || form.querySelector('button[type="submit"]')
+      || form.querySelector('input[type="submit"]')
+      || form.querySelector('button[name="actionButton"]')
+      || null;
+  }
+
   async function requestNewArenaOpponents(reason = null) {
     const form = document.querySelector('form[name="filterForm"][action*="getNewOpponents"][action*="aType=2"]');
-    const submit = form?.querySelector('input[type="submit"][name="actionButton"]') || form?.querySelector("input[type=submit]");
-    if (!form || !submit) return false;
+    const submit = findArenaOpponentRefreshControl();
+    if (!form || !submit) {
+      logAutoCombatDiagnostic("arena-opponent-refresh-control-missing", {
+        reason: reason || null,
+        url: location.href,
+        page: document.body?.id || null
+      });
+      return false;
+    }
     const currentCooldownMs = arenaCooldownMs();
     if (Number.isFinite(currentCooldownMs) && currentCooldownMs > 0) {
       arenaAutomationState.phase = "waiting-cooldown";
@@ -6595,7 +7451,7 @@
       arenaReportWaitStartedAt = 0;
       arenaAutomationState = {
         enabled: true, maxRuns, completedRuns: 0, opponentSearches: 0, bestObservedWinRate: null, lastBattle: null, attemptedOpponents: {},
-        pendingTargetKey: null, pendingTargetName: "", pendingReportId: null,
+        pendingTargetKey: null, pendingTargetName: "", confirmationRetryCount: 0, confirmationRetryTargetKey: null, pendingReportId: null,
         readiness: "unknown", readyAt: null,
           phase: "starting", startedAt: new Date().toISOString(), error: null
       };
@@ -6618,6 +7474,15 @@
     const postBattleDecision = buildAutoCombatPostBattleDecision("arena", id, arenaAutomationState.completedRuns, arenaAutomationState.maxRuns);
     arenaAutomationState.lastBattle = postBattleDecision;
     logAutoCombatDiagnostic("arena-post-battle-decision", postBattleDecision);
+    const matchedArenaTargetKey = arenaAutomationState.pendingTargetKey || null;
+    const predictedArenaWinRate = matchedArenaTargetKey ? Number(arenaOpponentAnalysisStore?.opponents?.[matchedArenaTargetKey]?.current?.winRate) : NaN;
+    if (Number.isFinite(predictedArenaWinRate) && ((postBattleDecision.result === "Loss" && predictedArenaWinRate >= 80) || (postBattleDecision.result === "Win" && predictedArenaWinRate <= 20))) {
+      logAutoCombatDiagnostic("arena-prediction-mismatch", {
+        target: postBattleDecision.opponent, targetKey: matchedArenaTargetKey, predictedWinRate: predictedArenaWinRate,
+        actualResult: postBattleDecision.result, reportId: id, simulations: arenaOpponentAnalysisStore?.opponents?.[matchedArenaTargetKey]?.simulations || null,
+        seed: arenaOpponentAnalysisStore?.opponents?.[matchedArenaTargetKey]?.seed || null, playerFingerprint: arenaOpponentAnalysisStore?.opponents?.[matchedArenaTargetKey]?.playerFingerprint || null
+      });
+    }
     arenaAutomationState.pendingTargetKey = null;
     arenaAutomationState.pendingTargetName = "";
     if (arenaAutomationState.completedRuns >= arenaAutomationState.maxRuns) {
@@ -6758,14 +7623,30 @@
     logAutoCombatDiagnostic("arena-opponent-analysis", { ok: analysis?.ok, completed: analysis?.completed, total: analysis?.total, failures: analysis?.failures, playerHp: analysis?.playerHp });
     await recordOpponentAnalysisSnapshot("arena", parseArenaOpponents(), arenaOpponentAnalysisStore);
     if (!analysis?.ok) {
-      arenaAutomationState.enabled = false;
-      arenaAutomationState.phase = "error";
+      if (analysis?.reason === "no-usable-opponents") {
+        const refreshed = await requestNewArenaOpponents("No available Arena opponent could be captured and simulated; requesting a fresh opponent set.");
+        if (refreshed) {
+          logAutoCombatDiagnostic("arena-analysis-refresh-requested", { reason: analysis.reason, completed: analysis.completed || 0, total: analysis.total || 0 });
+          return;
+        }
+      }
+      // Opponent analysis is a recoverable preparation step. A transient
+      // profile/parser/network failure must never terminate Auto Arena. Keep
+      // the module enabled and retry from the live opponent page.
+      arenaAutomationState.phase = "checking";
       arenaAutomationState.pendingTargetKey = null;
       arenaAutomationState.pendingTargetName = "";
-      arenaAutomationState.error = analysis?.error || "Could not capture and simulate every available Arena opponent.";
+      arenaAutomationState.error = analysis?.error || "Arena opponent analysis could not be completed; retrying.";
       await saveArenaAutomationState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("arena-analysis-blocked", { reason: analysis?.reason || null, error: arenaAutomationState.error });
+      logAutoCombatDiagnostic("arena-analysis-nonterminal-retry", {
+        reason: analysis?.reason || null,
+        completed: analysis?.completed || 0,
+        total: analysis?.total || 0,
+        failures: analysis?.failures || 0,
+        error: arenaAutomationState.error
+      });
+      scheduleAutoCombatResume(1000, "arena-analysis-retry");
       return;
     }
     const arenaLowWinRateSafeguard = lowWinRateOpponentSetSafeguard(
@@ -6784,14 +7665,17 @@
         logAutoCombatDiagnostic("arena-win-rate-safeguard-triggered", arenaLowWinRateSafeguard);
         return;
       }
-      arenaAutomationState.enabled = false;
-      arenaAutomationState.phase = "error";
+      arenaAutomationState.phase = "checking";
       arenaAutomationState.pendingTargetKey = null;
       arenaAutomationState.pendingTargetName = "";
-      arenaAutomationState.error = "The minimum Arena opponent win-rate safeguard triggered, but the Search for opponents control could not be clicked.";
+      arenaAutomationState.error = "Waiting for the Arena Search for opponents control after the minimum win-rate safeguard.";
       await saveArenaAutomationState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("arena-win-rate-safeguard-search-failed", arenaLowWinRateSafeguard);
+      logAutoCombatDiagnostic("arena-win-rate-safeguard-refresh-retry", {
+        ...arenaLowWinRateSafeguard,
+        reason: "refresh-control-unavailable"
+      });
+      scheduleAutoCombatResume(750, "arena-win-rate-safeguard-refresh-retry");
       return;
     }
     const simHeal = arenaNeedsSimulatorHealing();
@@ -6811,16 +7695,43 @@
       visibleOpponents: parseArenaOpponents().map(opponent => ({ key: opponent.key, name: opponent.name, level: opponent.level, province: opponent.province, playerId: opponent.playerId }))
     });
     if (!target) {
-      if (await requestNewArenaOpponents()) {
+      if (await requestNewArenaOpponents("No usable unattempted Arena opponent remains; requesting a fresh opponent set.")) {
         logAutoCombatDiagnostic("arena-opponent-refresh-clicked", {});
         return;
       }
-      arenaAutomationState.enabled = false;
-      arenaAutomationState.phase = "error";
-      arenaAutomationState.error = "No unattempted Arena opponent is available and the Search for opponents control could not be found.";
+      arenaAutomationState.phase = "checking";
+      arenaAutomationState.error = "No usable unattempted Arena opponent is available; waiting to retry the live Arena page.";
       await saveArenaAutomationState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("arena-error", { error: arenaAutomationState.error });
+      logAutoCombatDiagnostic("arena-target-retry-state", { reason: "no-target-and-refresh-unavailable" });
+      scheduleAutoCombatResume(1000, "arena-target-retry");
+      return;
+    }
+
+    const targetWinRate = Number(arenaOpponentAnalysisStore?.opponents?.[target.key]?.current?.winRate);
+    const targetThreshold = minimumOpponentWinRateThresholdPercent();
+    if (targetThreshold > 0 && (!Number.isFinite(targetWinRate) || targetWinRate < targetThreshold)) {
+      logAutoCombatDiagnostic("arena-target-blocked-win-rate", { target: target.name, winRate: Number.isFinite(targetWinRate) ? targetWinRate : null, threshold: targetThreshold });
+      arenaAutomationState.pendingTargetKey = null;
+      arenaAutomationState.pendingTargetName = "";
+      arenaAutomationState.phase = "queued";
+      arenaAutomationState.error = `Selected Arena opponent did not meet the ${targetThreshold}% minimum win-rate threshold; refreshing before any attack.`;
+      await saveArenaAutomationState();
+      renderAutoCombatUI();
+      await requestNewArenaOpponents(arenaAutomationState.error);
+      return;
+    }
+    const preTargetClickCooldownMs = arenaCooldownMs();
+    if (Number.isFinite(preTargetClickCooldownMs) && preTargetClickCooldownMs > 0) {
+      arenaAutomationState.pendingTargetKey = null;
+      arenaAutomationState.pendingTargetName = "";
+      arenaAutomationState.phase = "waiting-cooldown";
+      arenaAutomationState.error = `Waiting for Arena availability · ${formatExpeditionCooldown(preTargetClickCooldownMs)}.`;
+      setModuleReadiness("arena", preTargetClickCooldownMs);
+      await saveArenaAutomationState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("arena-target-blocked-cooldown", { cooldownMs: preTargetClickCooldownMs, target: target.name });
+      scheduleAutoCombatResume(Math.max(25, preTargetClickCooldownMs + 25), "arena-target-cooldown");
       return;
     }
 
@@ -6828,11 +7739,57 @@
     arenaAutomationState.pendingTargetName = target.name;
     arenaAutomationState.phase = "confirming";
     arenaAutomationState.error = null;
+    if (arenaAutomationState.confirmationRetryTargetKey !== target.key) {
+      arenaAutomationState.confirmationRetryTargetKey = target.key;
+      arenaAutomationState.confirmationRetryCount = 0;
+    }
+    const cooldownBeforeClickMs = arenaCooldownMs();
     await saveArenaAutomationState();
     renderAutoCombatUI();
 
+    const retryArenaConfirmation = async (reason, extra = {}) => {
+      const state = arenaAutomationState;
+      if (!state?.enabled) return;
+      const previousCount = state.confirmationRetryTargetKey === target.key ? (Number(state.confirmationRetryCount) || 0) : 0;
+      const nextCount = previousCount + 1;
+      state.confirmationRetryTargetKey = target.key;
+      state.confirmationRetryCount = nextCount;
+      delete state.attemptedOpponents[target.key];
+      state.pendingTargetKey = null;
+      state.pendingTargetName = "";
+      if (nextCount <= ARENA_CONFIRMATION_RETRY_LIMIT) {
+        state.phase = "queued";
+        state.error = `Arena confirmation was not completed; retrying the opponent (${nextCount}/${ARENA_CONFIRMATION_RETRY_LIMIT}).`;
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("arena-confirmation-retry", { target: target.name, retryCount: nextCount, retryLimit: ARENA_CONFIRMATION_RETRY_LIMIT, reason, ...extra });
+        scheduleAutoCombatResume(ARENA_CONFIRMATION_RETRY_DELAY_MS, "arena-confirmation-retry");
+        return;
+      }
+      state.confirmationRetryCount = 0;
+      state.confirmationRetryTargetKey = null;
+      const refreshed = await requestNewArenaOpponents(`Arena confirmation failed ${ARENA_CONFIRMATION_RETRY_LIMIT} times; requesting a fresh opponent set.`);
+      if (!refreshed) {
+        state.phase = "checking";
+        state.error = "Arena confirmation could not be completed; waiting to retry the live Arena page.";
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("arena-confirmation-refresh-fallback", { target: target.name, reason, ...extra });
+        scheduleAutoCombatResume(1000, "arena-confirmation-refresh-fallback");
+      }
+    };
+
     logAutoCombatDiagnostic("arena-click-opponent-start", { target: { key: target.key, name: target.name, level: target.level } });
-    const opponentClicked = await humanizedClick(target.button, "arena-opponent", { beforeClick: () => ensureAutoCombatHpSafety("arena", "opponent-click") });
+    const opponentClicked = await humanizedClick(target.button, "arena-opponent", {
+      beforeClick: async () => {
+        const cooldown = arenaCooldownMs();
+        if (Number.isFinite(cooldown) && cooldown > 0) {
+          logAutoCombatDiagnostic("arena-click-guard-cooldown", { target: target.name, cooldownMs: cooldown });
+          return false;
+        }
+        return ensureAutoCombatHpSafety("arena", "opponent-click");
+      }
+    });
     logAutoCombatDiagnostic("arena-click-opponent-result", { clicked: opponentClicked });
     if (!opponentClicked || !arenaAutomationState?.enabled) {
       if (autoHealingState?.active) {
@@ -6845,28 +7802,67 @@
         scheduleAutoCombatResume(0, "arena-waiting-healing");
         return;
       }
-      arenaAutomationState.phase = "error";
-      arenaAutomationState.error = "Arena opponent control disappeared before the click could be performed.";
-      await saveArenaAutomationState();
-      renderAutoCombatUI();
-      logAutoCombatDiagnostic("arena-error", { error: arenaAutomationState.error });
+      const failedClickCooldownMs = arenaCooldownMs();
+      if (Number.isFinite(failedClickCooldownMs) && failedClickCooldownMs > 0) {
+        arenaAutomationState.phase = "waiting-report";
+        arenaAutomationState.error = "Arena cooldown started during the click delay; treating the attack as started and refusing a retry click.";
+        arenaAutomationState.attemptedOpponents[target.key] = { name: target.name, level: target.level, province: target.province, playerId: target.playerId, profileHost: target.profileHost, attemptedAt: new Date().toISOString() };
+        await saveArenaAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("arena-click-blocked-after-cooldown-start", { target: target.name, cooldownMs: failedClickCooldownMs });
+        arenaReportWaitStartedAt = Date.now();
+        scheduleAutoCombatResume(350, "arena-click-blocked-after-cooldown-start");
+        return;
+      }
+      await retryArenaConfirmation("opponent-click-failed");
       return;
     }
-    arenaAutomationState.attemptedOpponents[target.key] = {
-      name: target.name, level: target.level, province: target.province, playerId: target.playerId,
-      profileHost: target.profileHost, attemptedAt: new Date().toISOString()
-    };
-    await saveArenaAutomationState();
 
-    const confirmButton = await waitForArenaConfirmation();
-    logAutoCombatDiagnostic("arena-confirmation-detected", { found: !!confirmButton });
-    if (!confirmButton || !arenaAutomationState?.enabled) {
-      arenaAutomationState.enabled = false;
-      arenaAutomationState.phase = "error";
-      arenaAutomationState.error = "Arena attack confirmation did not appear; automation stopped without retrying the opponent.";
+    const confirmState = await waitForArenaConfirmation({ cooldownBeforeClickMs });
+    logAutoCombatDiagnostic("arena-confirmation-detected", {
+      found: confirmState.kind === "confirmation", kind: confirmState.kind, reportId: confirmState.reportId || null, cooldownMs: confirmState.cooldownMs || null, elapsedMs: confirmState.elapsedMs
+    });
+    if (!arenaAutomationState?.enabled) return;
+
+    if (confirmState.kind === "report" && confirmState.reportId) {
+      arenaAutomationState.attemptedOpponents[target.key] = {
+        name: target.name, level: target.level, province: target.province, playerId: target.playerId,
+        profileHost: target.profileHost, attemptedAt: new Date().toISOString()
+      };
+      arenaAutomationState.confirmationRetryCount = 0;
+      arenaAutomationState.confirmationRetryTargetKey = null;
+      arenaAutomationState.pendingTargetKey = null;
+      arenaAutomationState.pendingTargetName = "";
+      arenaAutomationState.phase = "waiting-report";
+      arenaAutomationState.error = null;
       await saveArenaAutomationState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("arena-error", { error: arenaAutomationState.error });
+      arenaReportWaitStartedAt = Date.now();
+      logAutoCombatDiagnostic("arena-report-transition-after-opponent", { target: target.name, reportId: String(confirmState.reportId) });
+      scheduleAutoCombatResume(150, "arena-report-transition-detected");
+      return;
+    }
+
+    if (confirmState.kind === "cooldown") {
+      arenaAutomationState.attemptedOpponents[target.key] = {
+        name: target.name, level: target.level, province: target.province, playerId: target.playerId,
+        profileHost: target.profileHost, attemptedAt: new Date().toISOString()
+      };
+      arenaAutomationState.confirmationRetryCount = 0;
+      arenaAutomationState.confirmationRetryTargetKey = null;
+      arenaAutomationState.phase = "waiting-report";
+      arenaAutomationState.error = "Arena attack started; the confirmation dialog was not visible before the fight cooldown began.";
+      setModuleReadiness("arena", null);
+      await saveArenaAutomationState();
+      renderAutoCombatUI();
+      arenaReportWaitStartedAt = Date.now();
+      logAutoCombatDiagnostic("arena-attack-started-without-visible-confirmation", { target: target.name, cooldownMs: confirmState.cooldownMs });
+      scheduleAutoCombatResume(350, "arena-attack-started-without-confirmation");
+      return;
+    }
+
+    if (confirmState.kind !== "confirmation") {
+      await retryArenaConfirmation("confirmation-timeout", { timeoutMs: 9000, elapsedMs: confirmState.elapsedMs });
       return;
     }
 
@@ -6875,18 +7871,20 @@
     setModuleReadiness("arena", null);
     await saveArenaAutomationState();
     renderAutoCombatUI();
-    const confirmed = await humanizedClick(confirmButton, "arena-confirm");
+    const confirmed = await humanizedClick(confirmState.button, "arena-confirm");
     logAutoCombatDiagnostic("arena-click-confirm-result", { clicked: confirmed });
     if (!confirmed || !arenaAutomationState?.enabled) {
-      arenaAutomationState.enabled = false;
-      arenaAutomationState.phase = "error";
-      arenaAutomationState.error = "Arena confirmation disappeared before the click could be performed; automation stopped.";
-      await saveArenaAutomationState();
-      renderAutoCombatUI();
-      logAutoCombatDiagnostic("arena-error", { error: arenaAutomationState.error });
+      await retryArenaConfirmation("confirmation-click-failed");
       return;
     }
+    arenaAutomationState.attemptedOpponents[target.key] = {
+      name: target.name, level: target.level, province: target.province, playerId: target.playerId,
+      profileHost: target.profileHost, attemptedAt: new Date().toISOString()
+    };
+    arenaAutomationState.confirmationRetryCount = 0;
+    arenaAutomationState.confirmationRetryTargetKey = null;
     arenaAutomationState.phase = "waiting-report";
+    arenaAutomationState.error = null;
     await saveArenaAutomationState();
     renderAutoCombatUI();
     arenaReportWaitStartedAt = Date.now();
@@ -7004,6 +8002,10 @@
       if (!autoCombatEnabledModules().length) return;
       logAutoCombatDiagnostic("cooldown-observer-fired", { mutations: records.length });
       scheduleAutoCombatResume(0, "cooldown-header-mutation");
+      if (isCircusProvinciarumPage()) {
+        const cooldownMs = circusProvinciarumCooldownMs();
+        if (Number.isFinite(cooldownMs) && cooldownMs <= 0) scheduleNativeOpponentWinRateAutoAnalysis({ force: true });
+      }
     });
     [arenaFill, circusFill, dungeonFill, expeditionFill].filter(Boolean).forEach(node => {
       // Gladiatus updates the fill width frequently while cooling, but the
@@ -7030,6 +8032,14 @@
     }, delay);
   }
 
+  function circusRefreshAcceptedForScheduler() {
+    if (!circusProvinciarumAutomationState?.enabled) return false;
+    if (circusProvinciarumAutomationState.phase !== "refreshing") return false;
+    if (!isCircusProvinciarumPage()) return false;
+    const cooldownMs = circusProvinciarumCooldownMs();
+    return Number.isFinite(cooldownMs) && cooldownMs > 0;
+  }
+
   function autoCombatInFlightModule() {
     const continuations = new Set(["navigating", "waiting-report"]);
     const modules = autoCombatEnabledModules();
@@ -7037,6 +8047,8 @@
       const state = autoCombatModuleState(module);
       if (continuations.has(state?.phase)) return module;
       if (state?.phase === "refreshing") {
+        if (module === "provinciarum" && state?.refreshHandoffPending && isCircusProvinciarumOpponentRefreshPage()) continue;
+        if (module === "provinciarum" && circusRefreshAcceptedForScheduler()) continue;
         const refreshPage = module === "arena"
           ? isArenaOpponentRefreshPage()
           : module === "provinciarum"
@@ -7117,6 +8129,42 @@
     autoCombatSchedulerBusy = true;
     logAutoCombatDiagnostic("scheduler-start", { enabled });
     try {
+      if (circusRefreshAcceptedForScheduler()) {
+        const cooldownMs = circusProvinciarumCooldownMs();
+        circusProvinciarumAutomationState.phase = "waiting-cooldown";
+        circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(cooldownMs)}.`;
+        setModuleReadiness("provinciarum", cooldownMs);
+        releaseAutomationNavigation("provinciarum");
+        await saveCircusProvinciarumAutomationState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("provinciarum-refresh-accepted-scheduler-handoff", {
+          cooldownMs,
+          page: location.href,
+          nextAction: "shared-dispatcher"
+        });
+      }
+
+      if (circusProvinciarumAutomationState?.enabled
+        && circusProvinciarumAutomationState.refreshHandoffPending
+        && isCircusProvinciarumOpponentRefreshPage()) {
+        const refreshCooldownMs = circusProvinciarumCooldownMs();
+        if (Number.isFinite(refreshCooldownMs) && refreshCooldownMs > 0) {
+          circusProvinciarumAutomationState.phase = "waiting-cooldown";
+          circusProvinciarumAutomationState.error = `Waiting for Circus Provinciarum availability · ${formatExpeditionCooldown(refreshCooldownMs)}.`;
+          circusProvinciarumAutomationState.refreshHandoffPending = false;
+          circusProvinciarumAutomationState.refreshHandoffStartedAt = null;
+          setModuleReadiness("provinciarum", refreshCooldownMs);
+          releaseAutomationNavigation("provinciarum");
+          await saveCircusProvinciarumAutomationState();
+          renderAutoCombatUI();
+          logAutoCombatDiagnostic("provinciarum-refresh-handoff-finalized", {
+            cooldownMs: refreshCooldownMs,
+            page: location.href,
+            nextAction: "shared-dispatcher"
+          });
+        }
+      }
+
       const active = autoCombatInFlightModule();
       if (active) {
         const activeState = autoCombatModuleState(active);
@@ -7138,6 +8186,8 @@
 
       const busyModule = enabled.find(module => {
         const state = autoCombatModuleState(module);
+        if (module === "provinciarum" && state?.refreshHandoffPending && isCircusProvinciarumOpponentRefreshPage()) return false;
+        if (module === "provinciarum" && circusRefreshAcceptedForScheduler()) return false;
         return ["refreshing", "confirming", "humanizing", "attacking"].includes(state?.phase);
       });
       if (busyModule) {
@@ -7179,7 +8229,13 @@
         expedition: normalize(document.querySelector("#cooldown_bar_text_expedition")?.textContent || "")
       }});
 
-      const readyModules = enabled.filter(module => cooldowns[module] === 0);
+      // A Dungeon run reset is a control action, not a new Dungeon attack. Once the
+      // consecutive same-opponent loss limit is reached, allow the reset to be
+      // dispatched immediately even while the previous battle cooldown remains.
+      const readyModules = enabled.filter(module =>
+        !(module === "provinciarum" && circusProvinciarumAutomationState?.refreshHandoffPending)
+        && ((module === "dungeon" && autoDungeonState?.pendingRunReset) || cooldowns[module] === 0)
+      );
       if (readyModules.length) {
         const dispatch = routinePickReadyModule(enabled, readyModules);
         const selected = dispatch.selected;
@@ -7942,21 +8998,24 @@
     const state = autoDungeonState;
     const target = state?.dungeonName || state?.locationName || DUNGEON_LOCATION_NAME;
     const battles = Number(state?.completedBattles) || 0;
+    const lossStreak = Number(state?.consecutiveLosses) || 0;
+    const lossLimit = Math.max(1, Number(settings?.automation?.dungeonConsecutiveLossesBeforeReset) || 2);
+    const streakText = lossStreak > 0 ? ` · losses ${lossStreak}/${lossLimit}` : "";
     if (!state?.enabled) return state?.phase === "complete" ? `Complete · ${target} · ${battles} battles` : state?.phase === "error" ? `Stopped: ${state.error || "unexpected state"}` : "Stopped.";
     const encounter = state.pendingEncounterKind === "boss" ? "Boss" : state.pendingEncounterKind === "normal" ? "normal encounter" : "encounter";
     switch (state.phase) {
-      case "starting": return `Starting · ${target} · ${battles} battles`;
-      case "navigating": return `Opening ${target} · ${battles} battles`;
-      case "entering": return `Entering ${target} · starting new dungeon`;
-      case "waiting-map": return `Waiting for ${target} map · ${battles} battles`;
-      case "resetting": return `Resetting ${target} before Boss · ${battles} battles`;
-      case "waiting-report": return `Waiting for battle result · ${encounter} · ${battles} battles`;
-      case "waiting-cooldown": return `Waiting for dungeon point · ${target} · ${battles} battles`;
-      case "waiting-other": return `Waiting for dispatcher · ${target} · ${battles} battles`;
-      case "queued": return `Ready check · ${moduleReadinessLabel("dungeon")} · ${target} · ${battles} battles`;
-      case "checking": return `Checking Dungeon map · ${target} · ${battles} battles`;
-      case "humanizing": return `Preparing ${encounter} · ${target}`;
-      case "attacking": return `Dungeon ${encounter} started · ${target}`;
+      case "starting": return `Starting · ${target} · ${battles} battles${streakText}`;
+      case "navigating": return `Opening ${target} · ${battles} battles${streakText}`;
+      case "entering": return `Entering ${target} · starting new dungeon${streakText}`;
+      case "waiting-map": return `Waiting for ${target} map · ${battles} battles${streakText}`;
+      case "resetting": return `Resetting ${target} · ${battles} battles${streakText}`;
+      case "waiting-report": return `Waiting for battle result · ${encounter} · ${battles} battles${streakText}`;
+      case "waiting-cooldown": return `Waiting for dungeon point · ${target} · ${battles} battles${streakText}`;
+      case "waiting-other": return `Waiting for dispatcher · ${target} · ${battles} battles${streakText}`;
+      case "queued": return `Ready check · ${moduleReadinessLabel("dungeon")} · ${target} · ${battles} battles${streakText}`;
+      case "checking": return `Checking Dungeon map · ${target} · ${battles} battles${streakText}`;
+      case "humanizing": return `Preparing ${encounter} · ${target}${streakText}`;
+      case "attacking": return `Dungeon ${encounter} started · ${target}${streakText}`;
       case "complete": return `Complete · ${target} · ${battles} battles`;
       case "error": return `Stopped: ${state.error || "unexpected state"}`;
       default: return `Running · ${target} · ${battles} battles`;
@@ -7982,6 +9041,11 @@
           pendingReportId: stored.pendingReportId ? String(stored.pendingReportId) : null,
           lastReportId: stored.lastReportId ? String(stored.lastReportId) : null,
           noEncounterSince: Number.isFinite(Number(stored.noEncounterSince)) ? Number(stored.noEncounterSince) : null,
+          pendingOpponentKey: normalize(stored.pendingOpponentKey || "") || null,
+          lossStreakOpponentKey: normalize(stored.lossStreakOpponentKey || "") || null,
+          lossStreakOpponentLabel: normalize(stored.lossStreakOpponentLabel || "") || "",
+          consecutiveLosses: Math.max(0, Number(stored.consecutiveLosses) || 0),
+          pendingRunReset: stored.pendingRunReset === true,
           readiness: stored.readiness === "ready" || stored.readiness === "cooling" ? stored.readiness : "unknown",
           readyAt: Number.isFinite(Number(stored.readyAt)) ? Number(stored.readyAt) : null,
           phase: stored.phase || "stopped",
@@ -7994,7 +9058,8 @@
     autoDungeonState = {
       enabled: false, locationId: DUNGEON_LOCATION_ID, locationName: DUNGEON_LOCATION_NAME, dungeonId: null, dungeonName: "",
       completedBattles: 0, runComplete: false, cancelBeforeBoss: false, pendingEncounterKind: null, pendingEncounterLabel: "", pendingReportId: null, lastReportId: null,
-      noEncounterSince: null, readiness: "unknown", readyAt: null, phase: "stopped", startedAt: null, error: null
+      noEncounterSince: null, pendingOpponentKey: null, lossStreakOpponentKey: null, lossStreakOpponentLabel: "", consecutiveLosses: 0, pendingRunReset: false,
+      readiness: "unknown", readyAt: null, phase: "stopped", startedAt: null, error: null
     };
     return autoDungeonState;
   }
@@ -8128,6 +9193,11 @@
         pendingReportId: null,
         lastReportId: null,
         noEncounterSince: null,
+        pendingOpponentKey: null,
+        lossStreakOpponentKey: null,
+        lossStreakOpponentLabel: "",
+        consecutiveLosses: 0,
+        pendingRunReset: false,
         readiness: "unknown",
         readyAt: null,
         phase: "starting",
@@ -8216,51 +9286,176 @@
     return true;
   }
 
+  async function processPendingDungeonRunReset() {
+    if (!autoDungeonState?.enabled || !autoDungeonState.pendingRunReset) return false;
+    if (!isDungeonPage() || String(dungeonLocationIdFromUrl()) !== String(autoDungeonState.locationId)) return false;
+    const control = findDungeonCancelControl();
+    logAutoCombatDiagnostic("dungeon-loss-reset-check", {
+      pendingRunReset: true,
+      opponent: autoDungeonState.lossStreakOpponentLabel || autoDungeonState.pendingOpponentKey || null,
+      consecutiveLosses: Number(autoDungeonState.consecutiveLosses) || 0,
+      threshold: Math.max(1, Number(settings?.automation?.dungeonConsecutiveLossesBeforeReset) || 2),
+      cancelControlFound: !!control
+    });
+    if (!control) {
+      autoDungeonState.enabled = false;
+      autoDungeonState.phase = "error";
+      autoDungeonState.error = "The configured Dungeon consecutive-loss limit was reached, but the Dungeon reset control was not found. Automation stopped without starting another fight.";
+      autoDungeonState.pendingRunReset = false;
+      await saveAutoDungeonState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("dungeon-error", { error: autoDungeonState.error, reason: "loss-streak-reset-control-missing" });
+      return true;
+    }
+    autoDungeonState.phase = "resetting";
+    autoDungeonState.error = `Resetting Dungeon after ${autoDungeonState.consecutiveLosses} consecutive loss(es) against ${autoDungeonState.lossStreakOpponentLabel || "the same opponent"}.`;
+    await saveAutoDungeonState();
+    renderAutoCombatUI();
+    const clicked = await humanizedClick(control, "dungeon-loss-streak-reset");
+    logAutoCombatDiagnostic("dungeon-loss-reset-result", {
+      clicked,
+      opponent: autoDungeonState.lossStreakOpponentLabel || autoDungeonState.pendingOpponentKey || null,
+      consecutiveLosses: Number(autoDungeonState.consecutiveLosses) || 0
+    });
+    if (!clicked) {
+      autoDungeonState.enabled = false;
+      autoDungeonState.phase = "error";
+      autoDungeonState.error = "The Dungeon reset control disappeared before the reset click could be performed. Automation stopped without starting another fight.";
+      autoDungeonState.pendingRunReset = false;
+      await saveAutoDungeonState();
+      renderAutoCombatUI();
+      logAutoCombatDiagnostic("dungeon-error", { error: autoDungeonState.error, reason: "loss-streak-reset-click-failed" });
+      return true;
+    }
+    releaseAutomationNavigation("dungeon");
+    autoDungeonState.dungeonId = null;
+    autoDungeonState.dungeonName = "";
+    autoDungeonState.completedBattles = 0;
+    autoDungeonState.runComplete = false;
+    autoDungeonState.pendingEncounterKind = null;
+    autoDungeonState.pendingEncounterLabel = "";
+    autoDungeonState.pendingOpponentKey = null;
+    autoDungeonState.pendingReportId = null;
+    autoDungeonState.noEncounterSince = null;
+    autoDungeonState.lossStreakOpponentKey = null;
+    autoDungeonState.lossStreakOpponentLabel = "";
+    autoDungeonState.consecutiveLosses = 0;
+    autoDungeonState.pendingRunReset = false;
+    autoDungeonState.readiness = "unknown";
+    autoDungeonState.readyAt = null;
+    autoDungeonState.phase = "waiting-map";
+    autoDungeonState.error = `Dungeon reset after consecutive losses; waiting for the ${autoDungeonState.locationName || DUNGEON_LOCATION_NAME} dungeon map.`;
+    await saveAutoDungeonState();
+    renderAutoCombatUI();
+    logAutoCombatDiagnostic("dungeon-loss-streak-reset-complete", {
+      completedBattles: 0,
+      nextAction: "re-enter-selected-dungeon"
+    });
+    scheduleAutoCombatResume(750, "dungeon-loss-streak-reset-map-wait");
+    return true;
+  }
+
+  function dungeonOpponentKeyFromReport(report) {
+    const defender = report?.participants?.defenders?.[0] || null;
+    const name = normalize(defender?.name || "");
+    if (name && !/^defender\s+\d+$/i.test(name) && !/^unknown opponent$/i.test(name)) return name.toLowerCase();
+    const pending = normalize(autoDungeonState?.pendingOpponentKey || autoDungeonState?.pendingEncounterLabel || "");
+    return pending ? pending.toLowerCase() : null;
+  }
+
   async function markAutoDungeonBattleComplete(reportId, report = null) {
     if (!autoDungeonState?.enabled) return;
     dungeonReportWaitStartedAt = 0;
     const id = reportId ? String(reportId) : null;
     if (!id || id === autoDungeonState.lastReportId) return;
     const completedKind = autoDungeonState.pendingEncounterKind;
+    const completedOpponentKey = dungeonOpponentKeyFromReport(report);
+    const completedOpponentLabel = normalize(report?.participants?.defenders?.[0]?.name || autoDungeonState.pendingEncounterLabel || "") || "Unknown opponent";
     autoDungeonState.lastReportId = id;
     autoDungeonState.completedBattles = (Number(autoDungeonState.completedBattles) || 0) + 1;
     autoDungeonState.pendingReportId = null;
     autoDungeonState.pendingEncounterKind = null;
     autoDungeonState.pendingEncounterLabel = "";
+    autoDungeonState.pendingOpponentKey = null;
     autoDungeonState.noEncounterSince = null;
     if (report?.outcome?.type === "loss") {
-      releaseAutomationNavigation("dungeon");
-      stopAutoDungeonTimer();
-      autoDungeonState.enabled = false;
-      autoDungeonState.phase = "error";
-      autoDungeonState.error = `Dungeon battle lost after ${autoDungeonState.completedBattles} battle(s); automation stopped.`;
+      const sameOpponent = !!completedOpponentKey && String(completedOpponentKey).toLowerCase() === String(autoDungeonState.lossStreakOpponentKey || "").toLowerCase();
+      autoDungeonState.consecutiveLosses = sameOpponent ? (Number(autoDungeonState.consecutiveLosses) || 0) + 1 : 1;
+      autoDungeonState.lossStreakOpponentKey = completedOpponentKey || completedOpponentLabel.toLowerCase();
+      autoDungeonState.lossStreakOpponentLabel = completedOpponentLabel;
+      const threshold = Math.max(1, Number(settings?.automation?.dungeonConsecutiveLossesBeforeReset) || 2);
+      if ((Number(autoDungeonState.consecutiveLosses) || 0) >= threshold) {
+        releaseAutomationNavigation("dungeon");
+        stopAutoDungeonTimer();
+        autoDungeonState.pendingRunReset = true;
+        autoDungeonState.phase = "resetting";
+        autoDungeonState.error = `Dungeon loss limit reached: ${autoDungeonState.consecutiveLosses} consecutive loss(es) against ${completedOpponentLabel}; resetting the run.`;
+        await saveAutoDungeonState();
+        renderAutoCombatUI();
+        logAutoCombatDiagnostic("dungeon-loss-streak-reset-required", {
+          reportId: id, outcome: report.outcome, opponentKey: autoDungeonState.lossStreakOpponentKey,
+          opponentLabel: completedOpponentLabel, consecutiveLosses: autoDungeonState.consecutiveLosses, threshold
+        });
+        scheduleAutoCombatResume(0, "dungeon-loss-streak-reset");
+        return;
+      }
+      autoDungeonState.phase = "waiting-cooldown";
+      autoDungeonState.error = `Dungeon loss against ${completedOpponentLabel}; continuing after loss ${autoDungeonState.consecutiveLosses}/${threshold}.`;
+      const lossCooldownMs = readGlobalDungeonCooldownMs();
+      setModuleReadiness("dungeon", Number.isFinite(lossCooldownMs) ? lossCooldownMs : null);
       await saveAutoDungeonState();
       renderAutoCombatUI();
-      logAutoCombatDiagnostic("dungeon-error", { error: autoDungeonState.error, reportId: id, outcome: report.outcome });
-      if (autoCombatEnabledModules().length) scheduleAutoCombatResume(0, "dungeon-loss-handoff");
+      logAutoCombatDiagnostic("dungeon-loss-nonterminal", {
+        reportId: id, outcome: report.outcome, opponentKey: autoDungeonState.lossStreakOpponentKey,
+        opponentLabel: completedOpponentLabel, consecutiveLosses: autoDungeonState.consecutiveLosses, threshold,
+        cooldownMs: Number.isFinite(lossCooldownMs) ? lossCooldownMs : null
+      });
+      await completeAutoCombatModule("dungeon");
       return;
     }
+    // Any successful Dungeon battle breaks the consecutive-loss streak.
+    autoDungeonState.lossStreakOpponentKey = null;
+    autoDungeonState.lossStreakOpponentLabel = "";
+    autoDungeonState.consecutiveLosses = 0;
+    autoDungeonState.pendingRunReset = false;
     if (completedKind === "boss") {
+      // A successful Boss ends the current Dungeon instance, but it does not
+      // end Auto Dungeon. The automation should immediately cycle into a new
+      // Dungeon run rather than disabling the module. Losses against the
+      // same opponent are the only run-reset condition configured for normal
+      // combat failures.
+      const previousRunBattles = autoDungeonState.completedBattles;
       releaseAutomationNavigation("dungeon");
       stopAutoDungeonTimer();
-      autoDungeonState.enabled = false;
-      autoDungeonState.runComplete = true;
-      autoDungeonState.phase = "complete";
+      autoDungeonState.dungeonId = null;
+      autoDungeonState.dungeonName = "";
+      autoDungeonState.completedBattles = 0;
+      autoDungeonState.runComplete = false;
+      autoDungeonState.pendingEncounterKind = null;
+      autoDungeonState.pendingEncounterLabel = "";
+      autoDungeonState.pendingOpponentKey = null;
+      autoDungeonState.pendingReportId = null;
+      autoDungeonState.noEncounterSince = null;
+      autoDungeonState.lossStreakOpponentKey = null;
+      autoDungeonState.lossStreakOpponentLabel = "";
+      autoDungeonState.consecutiveLosses = 0;
+      autoDungeonState.pendingRunReset = false;
       autoDungeonState.readiness = "unknown";
       autoDungeonState.readyAt = null;
+      autoDungeonState.phase = "waiting-map";
+      autoDungeonState.error = "Dungeon Boss defeated; starting a new Dungeon run.";
       await saveAutoDungeonState();
       renderAutoCombatUI();
-      if (statusEl) statusEl.textContent = `Auto Dungeon complete · ${autoDungeonState.completedBattles} battles.`;
-      logAutoCombatDiagnostic("dungeon-complete", {
+      if (statusEl) statusEl.textContent = "Auto Dungeon: Boss defeated; starting a new run.";
+      logAutoCombatDiagnostic("dungeon-run-cycle", {
         reason: "boss-report-captured",
         reportId: id,
-        completedBattles: autoDungeonState.completedBattles,
-        terminalRun: true,
-        schedulerExcluded: true,
-        nextRoutineModule: autoCombatDispatchOrder(autoCombatEnabledModules())[0] || null
+        previousRunBattles,
+        nextAction: "start-new-dungeon-run",
+        terminalRun: false,
+        schedulerExcluded: false
       });
-      if (autoCombatEnabledModules().length) scheduleAutoCombatResume(0, "dungeon-boss-handoff");
-      else { stopAutoCombatDispatcherTimer(); stopAutoCombatCooldownObserver(); }
+      scheduleAutoCombatResume(0, "dungeon-boss-new-run");
       return;
     }
     // A normal Dungeon battle places only the Dungeon module on its own
@@ -8345,6 +9540,10 @@
       const opened = await navigateToDungeon();
       if (opened && autoDungeonState.enabled) scheduleAutoCombatResume(50, "dungeon-page-ready");
       return;
+    }
+
+    if (autoDungeonState.pendingRunReset) {
+      if (await processPendingDungeonRunReset()) return;
     }
 
     const pageState = dungeonPageStateSnapshot();
@@ -8465,6 +9664,7 @@
     autoDungeonState.noEncounterSince = null;
     autoDungeonState.pendingEncounterKind = target.kind;
     autoDungeonState.pendingEncounterLabel = target.label;
+    autoDungeonState.pendingOpponentKey = normalize(target.label || `type:${target.type}`) || `type:${target.type}`;
     autoDungeonState.pendingReportId = null;
     autoDungeonState.phase = "humanizing";
     autoDungeonState.error = null;
@@ -9326,7 +10526,7 @@
     return {
       simulationCount: 50,
       stats: { level: 33, strength: 89, dexterity: 114, agility: 136, constitution: 66, charisma: 61, intelligence: 50, armour: 1763, damage: 122 },
-      automation: { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, minimumOpponentWinRatePercent: 50, healingBagNumber: 514, avoidHealingOverheal: true, postBattleLootAction: "thorough" },
+      automation: { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, minimumOpponentWinRatePercent: 50, healingBagNumber: 514, avoidHealingOverheal: true, postBattleLootAction: "thorough", dungeonConsecutiveLossesBeforeReset: 2 },
       routine: ["expedition", "dungeon", "circus"],
       diagnosticCaptureEnabled: false,
       targets: [
@@ -9337,13 +10537,17 @@
   }
 
   function normalizeAutomationSettings(rawAutomation = {}) {
-    const defaults = { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, minimumOpponentWinRatePercent: 50, healingBagNumber: 514, avoidHealingOverheal: true, avoidHealingOverhealExplicit: false, postBattleLootAction: "thorough" };
+    const defaults = { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, minimumOpponentWinRatePercent: 50, healingBagNumber: 514, avoidHealingOverheal: true, avoidHealingOverhealExplicit: false, postBattleLootAction: "thorough", dungeonConsecutiveLossesBeforeReset: 2 };
     const rawMin = Number(rawAutomation?.preActionDelayMinMs);
     const rawMax = Number(rawAutomation?.preActionDelayMaxMs);
     const rawThreshold = Number(rawAutomation?.minimumHpThresholdPercent);
     const rawOpponentWinRate = Number(rawAutomation?.minimumOpponentWinRatePercent);
     const rawBag = Number(rawAutomation?.healingBagNumber);
+    const rawDungeonLossReset = Number(rawAutomation?.dungeonConsecutiveLossesBeforeReset);
     const rawLootAction = String(rawAutomation?.postBattleLootAction || "").toLowerCase().trim();
+    const dungeonConsecutiveLossesBeforeReset = Number.isFinite(rawDungeonLossReset)
+      ? Math.max(1, Math.min(10, Math.trunc(rawDungeonLossReset)))
+      : defaults.dungeonConsecutiveLossesBeforeReset;
     const postBattleLootAction = ["return", "quick", "thorough"].includes(rawLootAction) ? rawLootAction : defaults.postBattleLootAction;
     const explicitPreference = rawAutomation?.avoidHealingOverhealExplicit === true || String(rawAutomation?.avoidHealingOverhealExplicit).toLowerCase() === "true";
     const rawAvoidOverheal = rawAutomation?.avoidHealingOverheal;
@@ -9360,7 +10564,7 @@
     const minimumHpThresholdPercent = Number.isFinite(rawThreshold) ? Math.max(0, Math.min(100, Math.trunc(rawThreshold))) : defaults.minimumHpThresholdPercent;
     const minimumOpponentWinRatePercent = Number.isFinite(rawOpponentWinRate) ? Math.max(0, Math.min(100, Math.trunc(rawOpponentWinRate))) : defaults.minimumOpponentWinRatePercent;
     const healingBagNumber = Number.isFinite(rawBag) ? Math.max(1, Math.min(AUTO_HEALING_MAX_BAG_NUMBER, Math.trunc(rawBag))) : defaults.healingBagNumber;
-    const normalized = { preActionDelayMinMs: min, preActionDelayMaxMs: max, minimumHpThresholdPercent, minimumOpponentWinRatePercent, healingBagNumber, avoidHealingOverheal, avoidHealingOverhealExplicit: explicitPreference, postBattleLootAction };
+    const normalized = { preActionDelayMinMs: min, preActionDelayMaxMs: max, minimumHpThresholdPercent, minimumOpponentWinRatePercent, healingBagNumber, avoidHealingOverheal, avoidHealingOverhealExplicit: explicitPreference, postBattleLootAction, dungeonConsecutiveLossesBeforeReset };
     if (min > max) {
       normalized.preActionDelayMinMs = max;
       normalized.preActionDelayMaxMs = min;
@@ -11055,6 +12259,7 @@
       const bagInput = automation.querySelector('[data-auto-setting="healingBagNumber"]');
       const lootActionInput = automation.querySelector('[data-auto-setting="postBattleLootAction"]');
       const noOverhealInput = automation.querySelector('[data-auto-setting="avoidHealingOverheal"]');
+      const dungeonLossResetInput = automation.querySelector('[data-auto-setting="dungeonConsecutiveLossesBeforeReset"]');
       if (minInput) minInput.value = range.preActionDelayMinMs;
       if (maxInput) maxInput.value = range.preActionDelayMaxMs;
       if (hpInput) hpInput.value = range.minimumHpThresholdPercent;
@@ -11062,6 +12267,7 @@
       if (bagInput) bagInput.value = range.healingBagNumber;
       if (lootActionInput) lootActionInput.value = range.postBattleLootAction;
       if (noOverhealInput) noOverhealInput.checked = !!range.avoidHealingOverheal;
+      if (dungeonLossResetInput) dungeonLossResetInput.value = range.dungeonConsecutiveLossesBeforeReset;
       renderHealingInventorySelect();
     }
   }
@@ -11106,7 +12312,8 @@
       healingBagNumber: Number(shadow.querySelector('[data-auto-setting="healingBagNumber"]')?.value),
       avoidHealingOverheal: !!shadow.querySelector('[data-auto-setting="avoidHealingOverheal"]')?.checked,
       avoidHealingOverhealExplicit: true,
-      postBattleLootAction: String(shadow.querySelector('[data-auto-setting="postBattleLootAction"]')?.value || "thorough")
+      postBattleLootAction: String(shadow.querySelector('[data-auto-setting="postBattleLootAction"]')?.value || "thorough"),
+      dungeonConsecutiveLossesBeforeReset: Number(shadow.querySelector('[data-auto-setting="dungeonConsecutiveLossesBeforeReset"]')?.value)
     });
     await storageSet({ settings });
     if (previousSimulationCount !== settings.simulationCount) {
@@ -12373,6 +13580,32 @@
     return indicator;
   }
 
+  function nativeAuctionComparisonCandidateForElement(element) {
+    if (!element) return null;
+    const listing = element.closest?.(".auction_item_div") || element;
+    if (!listing?.matches?.(".auction_item_div")) return null;
+    const listings = Array.from(document.querySelectorAll(".auction_item_div"));
+    const index = listings.indexOf(listing);
+    if (index < 0) return null;
+    const category = getCurrentAuctionCategory();
+    const categoryValue = String(category.value ?? "0");
+    const listingId = auctionListingId(categoryValue, index);
+    const itemElement = element.closest?.('[data-tooltip][data-item-id], [data-tooltip][data-hash], [data-tooltip][class*="item-i-"]') || listing.querySelector('[data-tooltip][data-item-id], [data-tooltip][data-hash], [data-tooltip][class*="item-i-"]');
+    const itemHash = String(itemElement?.getAttribute("data-hash") || "").trim();
+    const itemId = String(itemElement?.getAttribute("data-item-id") || "").trim();
+    let fallback = null;
+    for (const [key, item] of nativeEquipmentComparisonCandidates.entries()) {
+      if (!item?.listingId) continue;
+      if (String(item.listingId) === listingId) return { key, item };
+      const candidateHash = String(item.itemHash || "").trim();
+      const candidateId = String(item.itemId || "").trim();
+      if (!fallback && itemHash && candidateHash && itemHash === candidateHash && (!itemId || !candidateId || itemId === candidateId)) {
+        fallback = { key, item };
+      }
+    }
+    return fallback;
+  }
+
   function nativeEquipmentComparisonCandidateForElement(element) {
     if (!element) return null;
     const sourceKey = nativeVisibleEquipmentSourceKey(element);
@@ -12429,102 +13662,158 @@
     return score;
   }
 
-  function findNativeItemTooltip(item) {
-    const itemName = String(item?.name || "").trim();
-    if (!itemName || !document.body) return null;
-    const seen = new Set();
-    const candidates = [];
-    const add = element => {
-      if (!element || seen.has(element) || element.closest?.("#gladiatus-assistant")) return;
-      seen.add(element);
-      if (!nativeItemTooltipVisible(element)) return;
-      if (!nativeItemTooltipTextMatches(element, itemName)) return;
-      const style = getComputedStyle(element);
-      if (!nativeItemTooltipLike(element) && !["absolute", "fixed"].includes(style.position)) return;
-      candidates.push(element);
-    };
-
-    const common = document.querySelectorAll('[role="tooltip"], [class*="tooltip"], [id*="tooltip"], [class*="tip-wrap"], [class~="tip"], [id="tooltip"]');
-    common.forEach(add);
-
-    if (!candidates.length) {
-      const all = document.querySelectorAll("div,table,tbody,ul,ol");
-      for (const element of all) {
-        if (candidates.length >= 40) break;
-        add(element);
-      }
-    }
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => nativeItemTooltipScore(b, itemName) - nativeItemTooltipScore(a, itemName));
-    let best = candidates[0];
-    // Prefer the outer tooltip container when the current best is a nested
-    // element inside another tooltip-like element containing the same item.
-    let parent = best.parentElement;
-    while (parent && parent !== document.body) {
-      if (nativeItemTooltipVisible(parent) && nativeItemTooltipTextMatches(parent, itemName) && nativeItemTooltipLike(parent)) best = parent;
-      parent = parent.parentElement;
-    }
-    return best;
+  function findNativeItemTooltip(_item) {
+    // Gladiatus uses a single live native tooltip container. We have verified
+    // that appending directly to section.tooltips is visible in-game, so do not
+    // require tooltip text, class heuristics, or a candidate ranking here.
+    const tooltip = document.querySelector("section.tooltips");
+    if (!tooltip || tooltip.closest?.("#gladiatus-assistant")) return null;
+    return nativeItemTooltipVisible(tooltip) ? tooltip : null;
   }
 
-  function appendNativeItemComparisonTooltipRow(tooltip, display, item, key) {
-    if (!tooltip || !display || !item) return false;
-    tooltip.querySelectorAll?.(".ga-native-item-tooltip-compare").forEach(row => row.remove());
-    const stateLabel = display.state === "upgrade" ? "Upgrade" : display.state === "downgrade" ? "Worse" : "Sidegrade";
-    const arrowText = display.state === "upgrade" ? "↑" : display.state === "downgrade" ? "↓" : "↔";
-    const makeCell = () => {
-      const cell = document.createElement("td");
-      cell.colSpan = 99;
-      cell.style.cssText = "padding:2px 0 0 0!important;margin:0!important;border:0!important;background:transparent!important;color:inherit!important;font:inherit!important;font-weight:700!important;line-height:inherit!important;text-align:left!important;white-space:nowrap!important;";
-      return cell;
-    };
-    const tag = String(tooltip.tagName || "").toLowerCase();
-    let row;
-    if (tag === "table" || tag === "tbody") {
-      row = document.createElement("tr");
-      const cell = makeCell();
-      row.appendChild(cell);
-      const body = tag === "tbody" ? tooltip : (tooltip.tBodies?.[0] || tooltip.appendChild(document.createElement("tbody")));
-      body.appendChild(row);
-    } else if (tag === "tr") {
-      row = document.createElement("tr");
-      row.appendChild(makeCell());
-      tooltip.parentElement?.appendChild(row);
-    } else {
-      row = document.createElement("div");
-      row.style.cssText = "display:block!important;margin:2px 0 0 0!important;padding:0!important;border:0!important;background:transparent!important;color:inherit!important;font:inherit!important;font-weight:700!important;line-height:inherit!important;white-space:nowrap!important;";
-      tooltip.appendChild(row);
+  function comparisonTooltipText(display) {
+    if (!display) return null;
+    if (display.state === "upgrade") return `↑ Upgrade · ${display.value}`;
+    if (display.state === "downgrade") return `↓ Worse · ${display.value}`;
+    if (display.state === "sidegrade") return `↔ Sidegrade · ${String(display.value || "").replace(/^Sidegrade\s*·\s*/i, "")}`;
+    return null;
+  }
+
+  function nativeTooltipComparisonContainer(tooltip) {
+    if (!tooltip) return null;
+    // Match the exact DOM path proven by the manual layering test.
+    return tooltip.firstElementChild || tooltip;
+  }
+
+  function removeNativeItemTooltipComparisonRows(exceptTooltip = null) {
+    document.querySelectorAll(".ga-native-item-tooltip-compare").forEach(row => {
+      const owner = row.closest?.(".tooltips");
+      if (exceptTooltip && owner === exceptTooltip) return;
+      row.remove();
+    });
+  }
+
+  function appendNativeItemTooltipComparisonRow(item, display) {
+    const tooltip = findNativeItemTooltip(item);
+    if (!tooltip) return false;
+    const text = comparisonTooltipText(display);
+    if (!text) return false;
+
+    const container = nativeTooltipComparisonContainer(tooltip);
+    if (!container) return false;
+
+    removeNativeItemTooltipComparisonRows(tooltip);
+    let row = container.querySelector(":scope > .ga-native-item-tooltip-compare");
+    if (!row) {
+      row = document.createElement("p");
+      row.className = "ga-native-item-tooltip-compare";
+      container.appendChild(row);
     }
-    const content = row.tagName?.toLowerCase() === "tr" ? row.firstElementChild : row;
-    if (!content) return false;
-    content.classList.add("ga-native-item-tooltip-compare");
-    content.dataset.equipmentKey = key;
-    content.title = display.title || `${stateLabel}: ${display.value}`;
-    const arrow = document.createElement("span");
-    arrow.textContent = arrowText;
-    arrow.style.cssText = `color:${display.color}!important;font-weight:700!important;margin-right:4px!important;font:inherit!important;`;
-    const textNode = document.createElement("span");
-    textNode.textContent = display.value;
-    textNode.style.cssText = "color:#000!important;font-weight:700!important;font:inherit!important;";
-    content.append(arrow, textNode);
+    row.textContent = text;
+    row.style.color = display.color || "#DDDDDD";
+    row.style.fontWeight = "700";
+    row.style.margin = "2px 0 0";
+    row.style.padding = "0";
+    row.title = display.title || "";
+    row.dataset.state = display.state || "";
+    // The native tooltip can keep an inline height based on its original
+    // content. Add a modest fixed amount of room once for this tooltip node so
+    // the injected comparison row is fully visible without repeatedly growing
+    // the tooltip on every MutationObserver pass.
+    try {
+      if (tooltip.dataset.gaComparisonHeightApplied !== "1") {
+        tooltip.style.maxHeight = "none";
+        tooltip.style.overflow = "visible";
+        const current = tooltip.getBoundingClientRect().height || parseFloat(getComputedStyle(tooltip).height) || 0;
+        const extra = Math.max(28, Math.ceil(row.getBoundingClientRect().height || 16) + 10);
+        tooltip.style.height = `${Math.ceil(current + extra)}px`;
+        tooltip.dataset.gaComparisonHeightApplied = "1";
+      }
+    } catch (_) {}
+
+    try {
+      recordAuctionComparisonDiagnostic("native-tooltip-comparison-rendered", {
+        itemName: String(item?.name || ""),
+        itemId: item?.itemId ?? null,
+        itemHash: item?.itemHash ?? null,
+        tooltipTag: tooltip.tagName,
+        tooltipId: tooltip.id || "",
+        tooltipClass: typeof tooltip.className === "string" ? tooltip.className : "",
+        tooltipZIndex: getComputedStyle(tooltip).zIndex,
+        rowText: text,
+        rowColor: row.style.color
+      }, { persist: true });
+    } catch (_) {}
     return true;
   }
 
   function renderNativeItemTooltipComparison() {
-    const element = nativeItemTooltipHoveredElement;
-    if (!element?.isConnected) return;
-    const candidate = nativeEquipmentComparisonCandidates.get(nativeItemTooltipHoveredKey) || nativeEquipmentComparisonCandidateForElement(element);
+    let element = nativeItemTooltipHoveredElement;
+    if (!element?.isConnected && nativeItemTooltipLastPointerItem?.isConnected) {
+      element = nativeItemTooltipLastPointerItem;
+      nativeItemTooltipHoveredElement = element;
+      const recovered = nativeEquipmentComparisonCandidateForElement(element);
+      nativeItemTooltipHoveredKey = recovered?.key || nativeItemTooltipHoveredKey || "";
+      try {
+        recordAuctionComparisonDiagnostic("native-tooltip-hover-recovered", {
+          itemId: element.getAttribute("data-item-id") || null,
+          itemHash: element.getAttribute("data-hash") || null,
+          candidateKey: recovered?.key || null
+        }, { persist: true });
+      } catch (_) {}
+    }
+    if (!element?.isConnected) {
+      removeNativeItemTooltipComparisonRows();
+      return;
+    }
+    let candidate = null;
+    const mappedItem = nativeEquipmentComparisonCandidates.get(nativeItemTooltipHoveredKey);
+    if (mappedItem) candidate = { key: nativeItemTooltipHoveredKey, item: mappedItem };
     if (!candidate) {
-      scheduleNativeEquipmentComparisonScan(80);
+      candidate = element.closest?.(".auction_item_div")
+        ? nativeAuctionComparisonCandidateForElement(element)
+        : nativeEquipmentComparisonCandidateForElement(element);
+    }
+    if (!candidate && nativeItemTooltipLastPointerItem === element) {
+      candidate = element.closest?.(".auction_item_div")
+        ? nativeAuctionComparisonCandidateForElement(element)
+        : nativeEquipmentComparisonCandidateForElement(element);
+    }
+    if (!candidate) {
+      try {
+        recordAuctionComparisonDiagnostic("native-tooltip-render-no-candidate", {
+          itemId: element.getAttribute("data-item-id") || null,
+          itemHash: element.getAttribute("data-hash") || null,
+          candidateCount: nativeEquipmentComparisonCandidates.size
+        }, { persist: true });
+      } catch (_) {}
       return;
     }
     if (!nativeItemTooltipHoveredKey) nativeItemTooltipHoveredKey = candidate.key;
     const comparison = getAuctionComparison(candidate.item);
     const display = nativeAuctionComparisonDisplay(comparison);
-    if (!display) return;
-    const tooltip = findNativeItemTooltip(candidate.item);
-    if (!tooltip) return;
-    appendNativeItemComparisonTooltipRow(tooltip, display, candidate.item, candidate.key);
+    if (!display) {
+      try {
+        recordAuctionComparisonDiagnostic("native-tooltip-render-no-display", {
+          itemId: candidate.item?.itemId ?? null,
+          itemName: candidate.item?.name || "",
+          key: candidate.key || null,
+          comparisonState: auctionComparisonState.forceResimulation ? "force-resimulation" : (comparison ? "result-unusable" : "comparison-not-ready"),
+          comparisonStatus: comparison?.status || null
+        }, { persist: true });
+      } catch (_) {}
+      removeNativeItemTooltipComparisonRows();
+      return;
+    }
+    try {
+      recordAuctionComparisonDiagnostic("native-tooltip-render-attempt", {
+        itemId: candidate.item?.itemId ?? null,
+        itemName: candidate.item?.name || "",
+        key: candidate.key || null,
+        tooltipExists: !!document.querySelector("section.tooltips")
+      }, { persist: true });
+    } catch (_) {}
+    appendNativeItemTooltipComparisonRow(candidate.item, display);
   }
 
   function scheduleNativeItemTooltipComparisonRender(delay = 40) {
@@ -12535,15 +13824,24 @@
     }, Math.max(0, Number(delay) || 0));
   }
 
-  function removeNativeItemTooltipComparisonRows() {
-    document.querySelectorAll(".ga-native-item-tooltip-compare").forEach(row => row.remove());
-  }
-
   function renderNativeEquipmentComparisonIndicators() {
-    // Generic equipment comparisons are now rendered inside Gladiatus' native
-    // item tooltip. Remove the legacy floating indicators so only one result
-    // is shown and it follows the game's own tooltip positioning.
+    // Generic equipment comparisons are rendered directly into the native
+    // Gladiatus tooltip DOM. This avoids a separate Assistant layer competing
+    // with the game's tooltip stacking context.
     document.querySelectorAll(".ga-native-equipment-compare").forEach(indicator => indicator.remove());
+    const liveElements = new Set();
+    for (const [key, candidate] of nativeEquipmentComparisonCandidates.entries()) {
+      if (!candidate?.item || candidate?.listingId) continue;
+      const comparison = getAuctionComparison(candidate.item);
+      const display = nativeAuctionComparisonDisplay(comparison);
+      const liveElement = findNativeEquipmentElementForComparison(candidate.item);
+      if (!liveElement) continue;
+      liveElements.add(liveElement);
+      if (!display) continue;
+      // Only append to an actually open native tooltip. The mouseover path will
+      // call this again as soon as Gladiatus creates the popup.
+      if (liveElement === nativeItemTooltipHoveredElement) appendNativeItemTooltipComparisonRow(candidate.item, display);
+    }
     scheduleNativeItemTooltipComparisonRender(0);
   }
 
@@ -12579,8 +13877,18 @@
     return `${universalKey}::${sourceKey || "source"}`;
   }
 
+  function shouldRunNativeEquipmentComparisonScan() {
+    if (!document.body) return false;
+    const directItems = document.querySelectorAll('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]');
+    if (directItems.length) return true;
+    if (document.querySelector('.auction_item_div, #char, #inventory, #warehouse, [class*="item-i-"]')) return true;
+    const bodyId = String(document.body.id || "");
+    return ["locationPage", "reportsPage", "auctionPage", "inventoryPage", "warehousePage"].includes(bodyId);
+  }
+
   async function runNativeEquipmentComparisonScan() {
     if (!statPriorityStateLoaded || nativeEquipmentComparisonScanInFlight) return;
+    if (!shouldRunNativeEquipmentComparisonScan()) return;
     if (!document.body) return;
     nativeEquipmentComparisonScanInFlight = true;
     const scanGeneration = ++nativeEquipmentComparisonScanGeneration;
@@ -12697,18 +14005,27 @@
         scheduleNativeEquipmentComparisonScan(160);
         scheduleNativeEquipmentComparisonRender();
       }, true);
+      document.addEventListener("mousemove", event => {
+        const itemElement = event.target?.closest?.('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]');
+        if (!itemElement || itemElement.closest?.("#char, .ga-host, #gladiatus-assistant")) return;
+        nativeItemTooltipLastPointerItem = itemElement;
+        nativeItemTooltipLastPointerAt = Date.now();
+      }, true);
       document.addEventListener("mouseover", event => {
         const itemElement = event.target?.closest?.('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]');
-        if (!itemElement || itemElement.closest?.("#char, .auction_item_div, .ga-host, #gladiatus-assistant")) return;
+        if (!itemElement || itemElement.closest?.("#char, .ga-host, #gladiatus-assistant")) return;
+        nativeItemTooltipLastPointerItem = itemElement;
+        nativeItemTooltipLastPointerAt = Date.now();
         if (nativeItemTooltipHoveredElement === itemElement) {
           scheduleNativeItemTooltipComparisonRender(70);
           return;
         }
         nativeItemTooltipHoveredElement = itemElement;
-        const candidate = nativeEquipmentComparisonCandidateForElement(itemElement);
+        const candidate = itemElement.closest?.(".auction_item_div")
+          ? nativeAuctionComparisonCandidateForElement(itemElement)
+          : nativeEquipmentComparisonCandidateForElement(itemElement);
         nativeItemTooltipHoveredKey = candidate?.key || "";
-        if (!candidate) scheduleNativeEquipmentComparisonScan(60);
-        scheduleNativeItemTooltipComparisonRender(70);
+        scheduleNativeItemTooltipComparisonRender(20);
       }, true);
       document.addEventListener("mouseout", event => {
         const itemElement = event.target?.closest?.('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"]');
@@ -12717,6 +14034,7 @@
         if (related && itemElement.contains?.(related)) return;
         nativeItemTooltipHoveredElement = null;
         nativeItemTooltipHoveredKey = "";
+        removeNativeItemTooltipComparisonRows();
         scheduleNativeItemTooltipComparisonRender(50);
       }, true);
       window.addEventListener("resize", () => scheduleNativeEquipmentComparisonRender(), { passive: true });
@@ -12729,7 +14047,7 @@
         const looksLikeOverlayNode = node => {
           if (!node?.matches) return false;
           const token = `${String(node.id || "")} ${String(node.className || "")}`.toLowerCase();
-          return node.getAttribute?.("role") === "tooltip" || node.getAttribute?.("role") === "dialog" || /(?:^|[-_ ])(?:tooltip|ui-tooltip|popup|dialog|blackoutdialog)(?:$|[-_ ])/i.test(token);
+          return node.getAttribute?.("role") === "tooltip" || node.getAttribute?.("role") === "dialog" || token.includes("tooltip") || /(?:^|[-_ ])(?:popup|dialog|blackoutdialog)(?:$|[-_ ])/i.test(token);
         };
         const containsEquipmentNode = node => {
           if (node.nodeType !== 1) return false;
@@ -12740,6 +14058,9 @@
         for (const record of records) {
           if (record.type === "attributes") {
             if (record.target?.closest?.("#gladiatus-assistant")) continue;
+            if (record.attributeName === "data-tooltip" && record.target?.getAttribute?.("data-ga-comparison-tooltip-active") === "1") {
+              continue;
+            }
             if (["data-item-id", "data-tooltip", "data-hash"].includes(record.attributeName)) needsScan = true;
             else if (record.attributeName === "class" && record.target?.matches?.('[data-item-id][class*="item-i-"], [data-hash][class*="item-i-"], .auction_item_div, [data-tooltip]')) needsScan = true;
             continue;
@@ -12755,7 +14076,25 @@
         }
         if (needsScan) scheduleNativeEquipmentComparisonScan(180);
         if (needsScan || needsRender) scheduleNativeEquipmentComparisonRender();
-        if (nativeItemTooltipHoveredElement && (needsRender || needsScan || records.some(record => record.type === "characterData" || record.type === "childList"))) {
+        const tooltipCreated = records.some(record => {
+          if (record.type !== "childList") return false;
+          return [...record.addedNodes].some(node => node.nodeType === 1 && (node.matches?.("section.tooltips") || node.querySelector?.("section.tooltips")));
+        });
+        if (tooltipCreated) {
+          try {
+            recordAuctionComparisonDiagnostic("native-tooltip-created-observed", {
+              lastPointerItemId: nativeItemTooltipLastPointerItem?.getAttribute?.("data-item-id") || null,
+              lastPointerItemHash: nativeItemTooltipLastPointerItem?.getAttribute?.("data-hash") || null,
+              lastPointerAgeMs: nativeItemTooltipLastPointerAt ? Date.now() - nativeItemTooltipLastPointerAt : null
+            }, { persist: true });
+          } catch (_) {}
+          if (!nativeItemTooltipHoveredElement?.isConnected && nativeItemTooltipLastPointerItem?.isConnected) {
+            nativeItemTooltipHoveredElement = nativeItemTooltipLastPointerItem;
+            const recovered = nativeEquipmentComparisonCandidateForElement(nativeItemTooltipLastPointerItem);
+            nativeItemTooltipHoveredKey = recovered?.key || "";
+          }
+          scheduleNativeItemTooltipComparisonRender(0);
+        } else if (nativeItemTooltipHoveredElement && (needsRender || needsScan || records.some(record => record.type === "characterData" || record.type === "childList"))) {
           scheduleNativeItemTooltipComparisonRender(30);
         }
       });
@@ -13358,7 +14697,7 @@
     const key = auctionComparisonResultKey(item);
     const state = auctionComparisonState;
     const hasStored = !!getAuctionComparison(item);
-    if ((!state.forceResimulation && hasStored) || state.inFlight.has(key) || state.queued.has(key)) return;
+    if (hasStored || state.inFlight.has(key) || state.queued.has(key)) return;
     if (state.forceResimulation) state.cache.delete(key);
     state.queued.add(key);
     state.queue.push({ key, item, generation: state.generation });
@@ -14457,7 +15796,7 @@
         <section class="ga-tab-panel${activeTab === "settings" ? " active" : ""}" data-panel="settings">
           <section class="ga-card"><h2>Global simulation</h2><div class="ga-field-grid"><label class="ga-field"><span>Simulations</span><input data-setting="simulationCount" type="number" min="1" max="10000" step="1"></label></div><div class="ga-muted" style="margin-top:5px">This single value is used for Stat Priority analysis, Arena opponent analysis, Circus Provinciarum opponent analysis, and Auction House item-comparison calculations. Lower values finish faster but produce noisier Monte Carlo estimates.</div></section>
           <section class="ga-card"><h2>Character stats</h2><div class="ga-field-grid" id="ga-settings-stats"></div></section>
-          <section class="ga-card"><h2>Auto Combat</h2><div class="ga-field-grid" id="ga-settings-automation"><label class="ga-field"><span>Pre-action delay minimum (ms)</span><input data-auto-setting="preActionDelayMinMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Pre-action delay maximum (ms)</span><input data-auto-setting="preActionDelayMaxMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Minimum HP threshold (%)</span><input data-auto-setting="minimumHpThresholdPercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Minimum opponent win rate (%)</span><input data-auto-setting="minimumOpponentWinRatePercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Healing inventory</span><select data-auto-setting="healingBagNumber"></select></label><label class="ga-field"><span>Post-battle loot search</span><select data-auto-setting="postBattleLootAction"><option value="thorough">Thorough Search</option><option value="quick">Quick Search</option><option value="return">Return to Safety</option></select></label><label class="ga-field"><span>Healing behavior</span><span style="display:flex;align-items:center;gap:7px"><input data-auto-setting="avoidHealingOverheal" type="checkbox"><span>Avoid overheal</span></span></label></div><div class="ga-muted" style="margin-top:5px">A fresh random integer delay is applied immediately before every automated Arena, Circus Provinciarum or Expedition click. When the optional post-battle loot screen appears after an Expedition or Dungeon battle, Auto Combat performs the selected action. When it does not appear, automation continues normally. When HP falls below the single configured threshold, Auto Combat pauses and automatically heals the main character from the selected in-game inventory page. When Avoid overheal is enabled, only healing combinations at or below the missing HP are allowed; if no zero-overheal combination exists, Auto Combat stops instead of wasting HP. When Minimum opponent win rate is above 0%, Auto Arena and Auto Circus request a fresh opponent set instead of fighting when every currently unattempted opponent is below that threshold. A value of 0 disables this safeguard. Healing uses the selected in-game inventory page; the internal bag number is handled automatically.</div></section>
+          <section class="ga-card"><h2>Auto Combat</h2><div class="ga-field-grid" id="ga-settings-automation"><label class="ga-field"><span>Pre-action delay minimum (ms)</span><input data-auto-setting="preActionDelayMinMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Pre-action delay maximum (ms)</span><input data-auto-setting="preActionDelayMaxMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Minimum HP threshold (%)</span><input data-auto-setting="minimumHpThresholdPercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Minimum opponent win rate (%)</span><input data-auto-setting="minimumOpponentWinRatePercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Healing inventory</span><select data-auto-setting="healingBagNumber"></select></label><label class="ga-field"><span>Post-battle loot search</span><select data-auto-setting="postBattleLootAction"><option value="thorough">Thorough Search</option><option value="quick">Quick Search</option><option value="return">Return to Safety</option></select></label><label class="ga-field"><span>Dungeon consecutive losses before reset</span><input data-auto-setting="dungeonConsecutiveLossesBeforeReset" type="number" min="1" max="10" step="1"></label><label class="ga-field"><span>Healing behavior</span><span style="display:flex;align-items:center;gap:7px"><input data-auto-setting="avoidHealingOverheal" type="checkbox"><span>Avoid overheal</span></span></label></div><div class="ga-muted" style="margin-top:5px">A fresh random integer delay is applied immediately before every automated Arena, Circus Provinciarum or Expedition click. When the optional post-battle loot screen appears after an Expedition or Dungeon battle, Auto Combat performs the selected action. When it does not appear, automation continues normally. When HP falls below the single configured threshold, Auto Combat pauses and automatically heals the main character from the selected in-game inventory page. When Avoid overheal is enabled, only healing combinations at or below the missing HP are allowed; if no zero-overheal combination exists, Auto Combat stops instead of wasting HP. When Minimum opponent win rate is above 0%, Auto Arena and Auto Circus request a fresh opponent set instead of fighting when every currently unattempted opponent is below that threshold. A value of 0 disables this safeguard. Dungeon only resets its current run after the configured number of consecutive losses against the same opponent; a win clears the loss streak and a loss against a different opponent starts a new streak. Healing uses the selected in-game inventory page; the internal bag number is handled automatically.</div></section>
           <section class="ga-settings-save"><span class="ga-settings-status" id="ga-settings-status"></span><button class="ga-primary" id="ga-save-settings" type="button">Save settings</button></section>
         </section>
       </div>
@@ -14580,11 +15919,10 @@
     await loadCircusProvinciarumAnalysisStore();
     renderNativeOpponentWinRateBadges();
     nativeOpponentWinRateAutoAnalysisReady = true;
-    scheduleNativeOpponentWinRateAutoAnalysis();
+    scheduleNativeOpponentWinRateAutoAnalysis({ force: true });
     await loadSimulatorState();
     await loadStatPriorityDiagnostics();
     await loadStatPriorityState();
-    invalidateAuctionComparisons("page-load-state-reset");
     await loadAuctionComparisonResults();
     initializeNativeEquipmentComparisonDisplay();
     scheduleNativeEquipmentComparisonScan(40);
