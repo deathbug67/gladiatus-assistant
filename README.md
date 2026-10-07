@@ -1,3 +1,10 @@
+## v0.5.97 — Database-backed Expedition Enemy item comparison
+- Adds an Item Comparison opponent setting with Player Clone (existing behavior) or Expedition Enemy.
+- Bundles combat-only Expedition enemy data derived from the Gladiatus Fansite expedition database for Italy, Africa, Germania and Britannia.
+- Every simulation rolls a fresh enemy profile from each configured stat range.
+- Baseline and candidate use the same enemy roll within each simulation, and all candidates in one comparison batch reuse the same generated enemy sample set.
+- Keeps the selected Expedition enemy and opponent mode in comparison fingerprints so persisted results are invalidated when the comparison target changes.
+
 ## v0.5.94 — Dungeon same-opponent loss reset
 - Dungeon losses are now non-terminal by default.
 - Tracks consecutive losses against the same opponent; losses against a different opponent start a new streak, and any win clears the streak.

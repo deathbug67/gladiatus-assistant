@@ -2,7 +2,7 @@
   "use strict";
 
   const api = globalThis.browser || globalThis.chrome;
-  const VERSION = "0.5.96";
+  const VERSION = "0.5.97";
   const STORAGE_KEY_PREFIX = "equipment:v0.2.5.9:";
   const OVERLAY_STATE_PREFIX = "overlay:v0.2.5.10:";
   const ACTIVE_TAB_PREFIX = "active-tab:v0.3.5:";
@@ -10527,6 +10527,7 @@
       simulationCount: 50,
       stats: { level: 33, strength: 89, dexterity: 114, agility: 136, constitution: 66, charisma: 61, intelligence: 50, armour: 1763, damage: 122 },
       automation: { preActionDelayMinMs: 342, preActionDelayMaxMs: 1967, minimumHpThresholdPercent: 30, minimumOpponentWinRatePercent: 50, healingBagNumber: 514, avoidHealingOverheal: true, postBattleLootAction: "thorough", dungeonConsecutiveLossesBeforeReset: 2 },
+      itemComparison: { opponentMode: "player-clone", expeditionEnemyKey: "germania:germania-expeditions/cave-temple:Legionnaire" },
       routine: ["expedition", "dungeon", "circus"],
       diagnosticCaptureEnabled: false,
       targets: [
@@ -10572,6 +10573,38 @@
     return normalized;
   }
 
+  function expeditionEnemyCatalog() {
+    const countries = globalThis.GladiatusExpeditionEnemyDatabase?.countries;
+    if (!countries || typeof countries !== "object") return [];
+    const rows = [];
+    for (const [countryKey, country] of Object.entries(countries)) {
+      for (const expedition of (Array.isArray(country?.expeditions) ? country.expeditions : [])) {
+        for (const enemy of (Array.isArray(expedition?.es) ? expedition.es : [])) {
+          const key = `${countryKey}:${String(expedition.s || "").trim()}:${String(enemy.n || "").trim()}`;
+          if (!enemy.n || !expedition.s) continue;
+          rows.push({ key, countryKey, countryName: country?.name || countryKey, expeditionName: expedition.n || expedition.s, expeditionSlug: expedition.s, name: enemy.n, isBoss: !!enemy.b, enemy });
+        }
+      }
+    }
+    return rows;
+  }
+
+  function defaultExpeditionEnemyKey() {
+    const catalog = expeditionEnemyCatalog();
+    const preferred = catalog.find(row => row.countryKey === "germania" && row.expeditionSlug === "germania-expeditions/cave-temple" && row.name === "Legionnaire");
+    return preferred?.key || catalog[0]?.key || "";
+  }
+
+  function normalizeItemComparisonSettings(rawComparison = {}) {
+    const rawMode = String(rawComparison?.opponentMode || "").trim().toLowerCase();
+    const opponentMode = rawMode === "expedition-enemy" ? "expedition-enemy" : "player-clone";
+    const catalog = expeditionEnemyCatalog();
+    const requestedKey = String(rawComparison?.expeditionEnemyKey || "").trim();
+    const fallbackKey = defaultExpeditionEnemyKey();
+    const expeditionEnemyKey = catalog.some(row => row.key === requestedKey) ? requestedKey : fallbackKey;
+    return { opponentMode, expeditionEnemyKey };
+  }
+
   function normalizeSettings(rawSettings = null) {
     const defaults = defaultSettings();
     const raw = rawSettings && typeof rawSettings === "object" ? rawSettings : {};
@@ -10585,6 +10618,7 @@
       simulationCount,
       stats: { ...defaults.stats, ...(raw.stats || {}) },
       automation: normalizeAutomationSettings(raw.automation),
+      itemComparison: normalizeItemComparisonSettings(raw.itemComparison),
       routine: Array.isArray(raw.routine) ? [...raw.routine] : [...defaults.routine],
       diagnosticCaptureEnabled: raw.diagnosticCaptureEnabled === true || String(raw.diagnosticCaptureEnabled).toLowerCase() === "true"
     };
@@ -12240,9 +12274,34 @@
     bagSelect.value = String(current);
   }
 
+  function renderItemComparisonSettings() {
+    const modeInput = shadow?.querySelector('[data-comparison-setting="opponentMode"]');
+    const enemyInput = shadow?.querySelector('[data-comparison-setting="expeditionEnemyKey"]');
+    if (!modeInput || !enemyInput) return;
+    const comparison = normalizeItemComparisonSettings(settings?.itemComparison);
+    modeInput.value = comparison.opponentMode;
+    const catalog = expeditionEnemyCatalog();
+    const grouped = new Map();
+    for (const row of catalog) {
+      if (!grouped.has(row.countryName)) grouped.set(row.countryName, []);
+      grouped.get(row.countryName).push(row);
+    }
+    enemyInput.innerHTML = Array.from(grouped.entries()).map(([countryName, rows]) => {
+      const options = rows.map(row => `<option value="${esc(row.key)}">${esc(row.expeditionName)} — ${esc(row.name)}${row.isBoss ? " ★" : ""}</option>`).join("");
+      return `<optgroup label="${esc(countryName)}">${options}</optgroup>`;
+    }).join("");
+    enemyInput.value = comparison.expeditionEnemyKey;
+    enemyInput.disabled = comparison.opponentMode !== "expedition-enemy";
+  }
+
+  function currentItemComparisonSettings() {
+    return normalizeItemComparisonSettings(settings?.itemComparison);
+  }
+
   function renderSettings() {
     const globalSimulationInput = shadow?.querySelector('[data-setting="simulationCount"]');
     if (globalSimulationInput) globalSimulationInput.value = String(globalSimulationCount());
+    renderItemComparisonSettings();
     const stats = shadow?.querySelector("#ga-settings-stats");
     if (!stats) return;
     stats.innerHTML = SETTINGS_STAT_KEYS.map(key => {
@@ -12297,6 +12356,7 @@
   async function saveSettingsFromUi() {
     settings = normalizeSettings(settings || defaultSettings());
     const previousSimulationCount = globalSimulationCount();
+    const previousItemComparison = JSON.stringify(currentItemComparisonSettings());
     const simulationInput = shadow.querySelector('[data-setting="simulationCount"]');
     settings.simulationCount = Math.max(1, Math.min(10000, Math.trunc(Number(simulationInput?.value) || 50)));
     settings.stats = settings.stats || {};
@@ -12304,6 +12364,10 @@
       const input = shadow.querySelector(`[data-setting-stat="${key}"]`);
       if (input) settings.stats[key] = Number(input.value || 0);
     }
+    settings.itemComparison = normalizeItemComparisonSettings({
+      opponentMode: String(shadow.querySelector('[data-comparison-setting="opponentMode"]')?.value || "player-clone"),
+      expeditionEnemyKey: String(shadow.querySelector('[data-comparison-setting="expeditionEnemyKey"]')?.value || "")
+    });
     settings.automation = normalizeAutomationSettings({
       preActionDelayMinMs: Number(shadow.querySelector('[data-auto-setting="preActionDelayMinMs"]')?.value),
       preActionDelayMaxMs: Number(shadow.querySelector('[data-auto-setting="preActionDelayMaxMs"]')?.value),
@@ -12316,6 +12380,7 @@
       dungeonConsecutiveLossesBeforeReset: Number(shadow.querySelector('[data-auto-setting="dungeonConsecutiveLossesBeforeReset"]')?.value)
     });
     await storageSet({ settings });
+    const itemComparisonChanged = previousItemComparison !== JSON.stringify(settings.itemComparison);
     if (previousSimulationCount !== settings.simulationCount) {
       auctionComparisonCurrentPlayerFingerprint = null;
       invalidateAuctionComparisons("global-simulation-count-changed");
@@ -12326,6 +12391,12 @@
       statPriorityState.training = null;
       void saveStatPriorityState("global-simulation-count-changed");
     }
+    if (itemComparisonChanged && previousSimulationCount === settings.simulationCount) {
+      auctionComparisonCurrentPlayerFingerprint = null;
+      invalidateAuctionComparisons("item-comparison-settings-changed");
+      scheduleNativeEquipmentComparisonScan(60);
+    }
+    renderItemComparisonSettings();
     renderStats(); renderTargets(); renderTraining();
     renderStatPriorityTab();
     renderNativeOpponentWinRateBadges();
@@ -12339,7 +12410,7 @@
     const equipment = statPriorityPlayerEquipment();
     if (!engine || !stats || !Object.keys(equipment || {}).length) return null;
     const comparisonSettings = auctionComparisonSettings();
-    return auctionComparisonPlayerFingerprint(stats, equipment, engine, comparisonSettings.simulations, comparisonSettings.seed);
+    return auctionComparisonPlayerFingerprint(stats, equipment, engine, comparisonSettings.simulations, comparisonSettings.seed, comparisonSettings);
   }
 
   async function refreshStats({ passive = false, silent = false } = {}) {
@@ -13034,17 +13105,19 @@
     return Object.fromEntries(Object.keys(SLOT_TO_CONTAINER).map(slot => [slot, auctionComparisonItemFingerprint(equipment?.[slot] || null)]));
   }
 
-  function auctionComparisonPlayerFingerprint(stats, equipment, engine, simulations, seed) {
+  function auctionComparisonPlayerFingerprint(stats, equipment, engine, simulations, seed, comparisonSettings = null) {
     const fields = [
       "level", "strength", "dexterity", "agility", "constitution", "charisma", "intelligence",
       "armour", "damageMin", "damageMax", "lifeMax", "healthMax"
     ];
+    const comparison = normalizeItemComparisonSettings(comparisonSettings || settings?.itemComparison);
     return JSON.stringify({
       engine: engine?.VERSION || "unknown",
       simulations,
       seed,
       stats: Object.fromEntries(fields.map(key => [key, stats?.[key] ?? null])),
-      equipment: auctionComparisonEquipmentFingerprint(equipment)
+      equipment: auctionComparisonEquipmentFingerprint(equipment),
+      comparisonOpponent: { opponentMode: comparison.opponentMode, expeditionEnemyKey: comparison.expeditionEnemyKey }
     });
   }
 
@@ -13122,10 +13195,85 @@
   }
 
   function auctionComparisonSettings() {
+    const comparison = normalizeItemComparisonSettings(settings?.itemComparison);
     return {
       simulations: globalSimulationCount(),
-      seed: Math.max(1, Math.floor(Number(statPriorityState.seed) || 1))
+      seed: Math.max(1, Math.floor(Number(statPriorityState.seed) || 1)),
+      opponentMode: comparison.opponentMode,
+      expeditionEnemyKey: comparison.expeditionEnemyKey
     };
+  }
+
+  function auctionComparisonRollInt(rng, range) {
+    const min = Math.trunc(Number(Array.isArray(range) ? range[0] : 0));
+    const max = Math.trunc(Number(Array.isArray(range) ? range[1] : min));
+    if (!Number.isFinite(min)) return 0;
+    if (!Number.isFinite(max) || max <= min) return min;
+    return min + Math.floor(rng() * (max - min + 1));
+  }
+
+  function buildExpeditionEnemyProfile(engine, source, seed) {
+    if (!source || !engine) throw new Error("Expedition comparison enemy data is unavailable.");
+    const rng = engine.createSeededRng(seed);
+    const level = auctionComparisonRollInt(rng, source.l);
+    const strength = auctionComparisonRollInt(rng, source.str);
+    const dexterity = auctionComparisonRollInt(rng, source.dex);
+    const agility = auctionComparisonRollInt(rng, source.agi);
+    const constitution = auctionComparisonRollInt(rng, source.con);
+    const charisma = auctionComparisonRollInt(rng, source.cha);
+    const intelligence = auctionComparisonRollInt(rng, source.int);
+    const armour = auctionComparisonRollInt(rng, source.a);
+    const damageMin = auctionComparisonRollInt(rng, source.dmin);
+    const damageMax = Math.max(damageMin, auctionComparisonRollInt(rng, source.dmax));
+    const lifeMax = Math.max(1, auctionComparisonRollInt(rng, source.hp));
+    const critical = Math.max(0, Math.trunc(Number(source.cr) || 0));
+    const block = Math.max(0, Math.trunc(Number(source.bl) || 0));
+    const avoidCritical = Math.max(0, Math.trunc(Number(source.ac) || 0));
+    const profile = engine.buildProfile({
+      equipmentSnapshot: {},
+      stats: {
+        level, strength, dexterity, agility, constitution, charisma, intelligence,
+        armour, damageMin, damageMax, lifeMax, lifeCurrent: lifeMax,
+        dinoPoints: {
+          critical: Math.max(0, Math.floor(dexterity / 10) + critical),
+          block: Math.max(0, Math.floor(strength / 10) + block),
+          avoidCritical: Math.max(0, Math.floor(agility / 10) + avoidCritical)
+        }
+      },
+      explicitLifeMax: lifeMax,
+      explicitArmour: armour,
+      explicitDamageRange: `${damageMin}-${damageMax}`,
+      recalculateDerived: false,
+      name: source.n || "Expedition Enemy"
+    });
+    profile.lifeCurrent = profile.lifeMax;
+    profile.dinoPoints = {
+      critical: Math.max(0, Math.floor(profile.dexterity / 10) + critical),
+      block: Math.max(0, Math.floor(profile.strength / 10) + block),
+      avoidCritical: Math.max(0, Math.floor(profile.agility / 10) + avoidCritical)
+    };
+    return profile;
+  }
+
+  function buildAuctionComparisonExpeditionSamples(engine, settingsSnapshot) {
+    const catalog = expeditionEnemyCatalog();
+    const selected = catalog.find(row => row.key === settingsSnapshot.expeditionEnemyKey);
+    if (!selected) throw new Error("Selected Expedition comparison enemy is unavailable in the bundled database.");
+    const count = Math.max(1, Math.trunc(Number(settingsSnapshot.simulations) || 50));
+    const baseSeed = Math.max(1, Math.trunc(Number(settingsSnapshot.seed) || 1));
+    const enemies = new Array(count);
+    for (let i = 0; i < count; i++) {
+      // A separate seeded enemy profile is generated for every simulation. The
+      // exact same profile object is then shared by baseline and every candidate.
+      enemies[i] = buildExpeditionEnemyProfile(engine, selected.enemy, baseSeed + ((i + 1) * 0x9E3779B1));
+    }
+    return { enemies, selected };
+  }
+
+  function auctionComparisonOpponentLabel(settingsSnapshot) {
+    if (settingsSnapshot?.opponentMode !== "expedition-enemy") return "Player Clone";
+    const row = expeditionEnemyCatalog().find(entry => entry.key === settingsSnapshot.expeditionEnemyKey);
+    return row ? `${row.countryName} — ${row.expeditionName} — ${row.name}` : "Expedition Enemy";
   }
 
   function auctionComparisonLegacyResultKey(item) {
@@ -14142,7 +14290,7 @@
     const currentStats = { ...(mainProfile.stats || {}), name: mainProfile.name || mainProfile.stats?.name || "Main Character" };
     const equipment = mainProfile.equipment || {};
 
-    const key = auctionComparisonPlayerFingerprint(currentStats, equipment, engine, settingsSnapshot.simulations, settingsSnapshot.seed);
+    const key = auctionComparisonPlayerFingerprint(currentStats, equipment, engine, settingsSnapshot.simulations, settingsSnapshot.seed, settingsSnapshot);
     auctionComparisonCurrentPlayerFingerprint = key;
     if (auctionComparisonState.context?.key === key) return auctionComparisonState.context;
 
@@ -14167,19 +14315,28 @@
     });
     dummy.lifeCurrent = dummy.lifeMax;
 
+    let opponentSamples = null;
+    let selectedExpeditionEnemy = null;
+    if (settingsSnapshot.opponentMode === "expedition-enemy") {
+      const sampled = buildAuctionComparisonExpeditionSamples(engine, settingsSnapshot);
+      opponentSamples = sampled.enemies;
+      selectedExpeditionEnemy = sampled.selected;
+    }
+    const comparisonEnemy = opponentSamples?.[0] || dummy;
     const options = { simulations: settingsSnapshot.simulations, seed: settingsSnapshot.seed, lifeMode: "full", maxRounds: ARENA_SIMULATION_ROUNDS };
-    setAuctionComparisonDiagnosticStage("context-built", { equipmentSlots: Object.keys(equipment).length, simulationCount: settingsSnapshot.simulations, seed: settingsSnapshot.seed }, true);
-    setAuctionComparisonDiagnosticStage("baseline-start", { simulations: settingsSnapshot.simulations, chunkSize: 25, seed: settingsSnapshot.seed }, true);
+    setAuctionComparisonDiagnosticStage("context-built", { equipmentSlots: Object.keys(equipment).length, simulationCount: settingsSnapshot.simulations, seed: settingsSnapshot.seed, opponentMode: settingsSnapshot.opponentMode, opponent: auctionComparisonOpponentLabel(settingsSnapshot), sampledEnemies: opponentSamples?.length || 0 }, true);
+    setAuctionComparisonDiagnosticStage("baseline-start", { simulations: settingsSnapshot.simulations, chunkSize: 25, seed: settingsSnapshot.seed, opponentMode: settingsSnapshot.opponentMode }, true);
     const baseline = await engine.simulateBatchAsync({
       player: basePlayer,
-      enemy: dummy,
+      enemy: comparisonEnemy,
+      enemies: opponentSamples,
       ...options,
       chunkSize: 25,
       onProgress: info => noteAuctionComparisonSimulationProgress("baseline-progress", info),
       onYield: info => recordAuctionComparisonDiagnostic("baseline-yield", info, { persist: true })
     });
     setAuctionComparisonDiagnosticStage("baseline-complete", { simulations: baseline?.simulations, winRate: baseline?.rates?.win }, true);
-    const context = { generation, key, engine, settings: settingsSnapshot, equipment, currentStats, basePlayer, dummy, baseline, baselineWinRate: Number(baseline?.rates?.win || 0) };
+    const context = { generation, key, engine, settings: settingsSnapshot, equipment, currentStats, basePlayer, dummy, opponentSamples, selectedExpeditionEnemy, baseline, baselineWinRate: Number(baseline?.rates?.win || 0), opponentLabel: auctionComparisonOpponentLabel(settingsSnapshot) };
     if (generation === auctionComparisonState.generation) {
       auctionComparisonState.context = context;
       auctionComparisonState.contextPromise = null;
@@ -14207,7 +14364,7 @@
     setAuctionComparisonDiagnosticStage("context-start", { slotKey }, true);
     const context = await auctionComparisonContextPromise();
     setAuctionComparisonDiagnosticStage("context-complete", { baselineWinRate: context?.baselineWinRate, simulations: context?.settings?.simulations }, true);
-    const { engine, equipment, dummy, baseline, settings } = context;
+    const { engine, equipment, dummy, opponentSamples, baseline, settings } = context;
     const targets = slotKey === "ring"
       ? [{ slot: "ring1", item: equipment?.ring1 || null }, { slot: "ring2", item: equipment?.ring2 || null }]
       : [{ slot: slotKey, item: equipment?.[slotKey] || null }];
@@ -14227,7 +14384,7 @@
         currentEquipmentSnapshot: equipment,
         hypotheticalEquipmentSnapshot: hypotheticalEquipment,
         liveStats: context.currentStats,
-        opponentStats: dummy
+        opponentStats: opponentSamples?.[0] || dummy
       });
       candidateProfile.name = context.basePlayer.name;
       candidateProfile.lifeCurrent = candidateProfile.lifeMax;
@@ -14242,7 +14399,8 @@
       setAuctionComparisonDiagnosticStage("candidate-simulation-start", { slot: target.slot, simulations: settings.simulations, chunkSize: 25, seed: settings.seed }, true);
       const test = await engine.simulateBatchAsync({
         player: candidateProfile,
-        enemy: dummy,
+        enemy: opponentSamples?.[0] || dummy,
+        enemies: opponentSamples,
         simulations: settings.simulations,
         seed: settings.seed,
         lifeMode: "full",
@@ -14271,6 +14429,8 @@
       relativeChange: relative,
       simulations: settings.simulations,
       seed: settings.seed,
+      comparisonOpponent: context.opponentLabel,
+      comparisonOpponentMode: settings.opponentMode,
       statDifferences: auctionComparisonStatDifferences(item, best.currentItem),
       candidateProfile: best.candidateProfile,
       playerFingerprint: context.key,
@@ -15795,6 +15955,7 @@
 
         <section class="ga-tab-panel${activeTab === "settings" ? " active" : ""}" data-panel="settings">
           <section class="ga-card"><h2>Global simulation</h2><div class="ga-field-grid"><label class="ga-field"><span>Simulations</span><input data-setting="simulationCount" type="number" min="1" max="10000" step="1"></label></div><div class="ga-muted" style="margin-top:5px">This single value is used for Stat Priority analysis, Arena opponent analysis, Circus Provinciarum opponent analysis, and Auction House item-comparison calculations. Lower values finish faster but produce noisier Monte Carlo estimates.</div></section>
+          <section class="ga-card"><h2>Item Comparison</h2><div class="ga-field-grid"><label class="ga-field"><span>Comparison opponent</span><select data-comparison-setting="opponentMode"><option value="player-clone">Player Clone</option><option value="expedition-enemy">Expedition Enemy</option></select></label><label class="ga-field"><span>Expedition enemy</span><select data-comparison-setting="expeditionEnemyKey"></select></label></div><div class="ga-muted" style="margin-top:5px">Player Clone keeps the existing behavior. Expedition Enemy uses the bundled Gladiatus Fansite enemy database. Every simulation gets a new random roll for each ranged enemy stat; the baseline and candidate use the same rolled enemy for that simulation, and the same sampled enemy set is reused across all candidate items in the comparison batch.</div></section>
           <section class="ga-card"><h2>Character stats</h2><div class="ga-field-grid" id="ga-settings-stats"></div></section>
           <section class="ga-card"><h2>Auto Combat</h2><div class="ga-field-grid" id="ga-settings-automation"><label class="ga-field"><span>Pre-action delay minimum (ms)</span><input data-auto-setting="preActionDelayMinMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Pre-action delay maximum (ms)</span><input data-auto-setting="preActionDelayMaxMs" type="number" min="0" max="60000" step="1"></label><label class="ga-field"><span>Minimum HP threshold (%)</span><input data-auto-setting="minimumHpThresholdPercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Minimum opponent win rate (%)</span><input data-auto-setting="minimumOpponentWinRatePercent" type="number" min="0" max="100" step="1"></label><label class="ga-field"><span>Healing inventory</span><select data-auto-setting="healingBagNumber"></select></label><label class="ga-field"><span>Post-battle loot search</span><select data-auto-setting="postBattleLootAction"><option value="thorough">Thorough Search</option><option value="quick">Quick Search</option><option value="return">Return to Safety</option></select></label><label class="ga-field"><span>Dungeon consecutive losses before reset</span><input data-auto-setting="dungeonConsecutiveLossesBeforeReset" type="number" min="1" max="10" step="1"></label><label class="ga-field"><span>Healing behavior</span><span style="display:flex;align-items:center;gap:7px"><input data-auto-setting="avoidHealingOverheal" type="checkbox"><span>Avoid overheal</span></span></label></div><div class="ga-muted" style="margin-top:5px">A fresh random integer delay is applied immediately before every automated Arena, Circus Provinciarum or Expedition click. When the optional post-battle loot screen appears after an Expedition or Dungeon battle, Auto Combat performs the selected action. When it does not appear, automation continues normally. When HP falls below the single configured threshold, Auto Combat pauses and automatically heals the main character from the selected in-game inventory page. When Avoid overheal is enabled, only healing combinations at or below the missing HP are allowed; if no zero-overheal combination exists, Auto Combat stops instead of wasting HP. When Minimum opponent win rate is above 0%, Auto Arena and Auto Circus request a fresh opponent set instead of fighting when every currently unattempted opponent is below that threshold. A value of 0 disables this safeguard. Dungeon only resets its current run after the configured number of consecutive losses against the same opponent; a win clears the loss streak and a loss against a different opponent starts a new streak. Healing uses the selected in-game inventory page; the internal bag number is handled automatically.</div></section>
           <section class="ga-settings-save"><span class="ga-settings-status" id="ga-settings-status"></span><button class="ga-primary" id="ga-save-settings" type="button">Save settings</button></section>
@@ -15885,6 +16046,10 @@
     shadow.querySelector("#ga-clear-master-diagnostics").addEventListener("click", () => void clearMasterDiagnostics());
     shadow.querySelector("#ga-toggle-diagnostic-capture").addEventListener("click", () => void toggleDiagnosticCapture());
     shadow.querySelector("#ga-save-settings").addEventListener("click", saveSettingsFromUi);
+    shadow.querySelector('[data-comparison-setting="opponentMode"]')?.addEventListener("change", event => {
+      const enemyInput = shadow.querySelector('[data-comparison-setting="expeditionEnemyKey"]');
+      if (enemyInput) enemyInput.disabled = String(event.target?.value || "player-clone") !== "expedition-enemy";
+    });
     shadow.querySelector('[data-auto-setting="avoidHealingOverheal"]').addEventListener("change", () => void saveAvoidOverhealSettingFromUi());
     shadow.querySelector("#ga-refresh-saved").addEventListener("click", loadSavedEquipment);
 

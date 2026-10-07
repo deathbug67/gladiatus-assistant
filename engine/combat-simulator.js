@@ -1134,7 +1134,8 @@
     const count = Math.max(1, Math.min(10000, Math.floor(finite(simulations, 500))));
     const acc = createBatchAccumulator(includeResults);
     for (let i = 0; i < count; i++) {
-      const result = simulateBattle({ player, enemy, seed: finite(seed, 1) + i, ...options });
+      const simulationEnemy = Array.isArray(options.enemies) && options.enemies[i] ? options.enemies[i] : enemy;
+      const result = simulateBattle({ player, enemy: simulationEnemy, seed: finite(seed, 1) + i, ...options });
       addBatchResult(acc, result);
     }
     return finalizeBatch(acc, count, options);
@@ -1151,7 +1152,8 @@
       try { onProgress({ completed: 0, total: count, chunkSize: chunk, chunkElapsedMs: 0, totalElapsedMs: 0 }); } catch (_) {}
     }
     for (let i = 0; i < count; i++) {
-      const result = simulateBattle({ player, enemy, seed: baseSeed + i, ...options });
+      const simulationEnemy = Array.isArray(options.enemies) && options.enemies[i] ? options.enemies[i] : enemy;
+      const result = simulateBattle({ player, enemy: simulationEnemy, seed: baseSeed + i, ...options });
       addBatchResult(acc, result);
       const completed = i + 1;
       if (completed % chunk === 0 || completed === count) {
