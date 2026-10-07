@@ -1,3 +1,26 @@
+## v0.5.101 — GitHub commit identity correction
+- Corrects the repository-local Git identity to the GitHub-associated noreply address.
+- Rewrites the included local project history so v0.5.97–v0.5.100 commits use the same GitHub-associated identity.
+
+## v0.5.100 — Farming Advisor profile-loading refresh
+- Fixes the Farming Advisor Analyze button remaining disabled after menu/page navigation when the saved character profile loads asynchronously after the initial panel render.
+- Re-renders the Farming tab after the persisted character profile and Farming Advisor state are loaded.
+- Keeps persisted Farming Advisor results until the user explicitly starts a new simulation.
+
+## v0.5.99 — Persistent Farming Advisor results
+- Keeps completed and partial Farming Advisor results in browser storage across Gladiatus menu/page navigation and full page reloads.
+- A new simulation explicitly replaces the previous result; navigating between menus no longer clears it.
+- Persists partial target results during an active analysis so completed targets remain visible after navigation.
+- Preserves non-finite efficiency values such as Infinity when restoring saved results.
+
+## v0.5.98 — Expedition Farming Advisor
+- Adds a Farming Advisor tab powered by the existing DinoDevs combat simulator and bundled Expedition enemy database.
+- Analyzes randomized enemy profiles for every selected expedition target and ranks targets by simulated win rate, average HP lost, sustainable fights before the configured HP threshold, and a transparent risk-adjusted HP-efficiency metric.
+- Defaults to currently accessible locations in the detected country, while supporting all locations in the selected country or the full database for planning.
+- Keeps targets below the configured minimum win-rate requirement visible but ranks eligible targets first.
+- Uses asynchronous Monte Carlo simulation with incremental progress and a stop-after-current-target control.
+- Farming v1 is combat-efficiency only; gold, XP, and loot economics are intentionally not included until reward/location association is available.
+
 ## v0.5.97 — Database-backed Expedition Enemy item comparison
 - Adds an Item Comparison opponent setting with Player Clone (existing behavior) or Expedition Enemy.
 - Bundles combat-only Expedition enemy data derived from the Gladiatus Fansite expedition database for Italy, Africa, Germania and Britannia.

@@ -2,7 +2,7 @@
   "use strict";
 
   const api = globalThis.browser || globalThis.chrome;
-  const VERSION = "0.5.97";
+  const VERSION = "0.5.101";
   const STORAGE_KEY_PREFIX = "equipment:v0.2.5.9:";
   const OVERLAY_STATE_PREFIX = "overlay:v0.2.5.10:";
   const ACTIVE_TAB_PREFIX = "active-tab:v0.3.5:";
@@ -47,6 +47,7 @@
   const COMBAT_STORAGE_PREFIX = "combat:v0.3.6:";
   const SIMULATOR_STATE_PREFIX = "combat-simulator:v0.4.5:";
   const STAT_PRIORITY_STORAGE_PREFIX = "stat-priority:v0.1:";
+  const FARMING_ADVISOR_STORAGE_PREFIX = "farming-advisor:v0.1:";
   const STAT_PRIORITY_DIAGNOSTIC_PREFIX = "stat-priority-diagnostics:v0.5.26:";
   const STAT_PRIORITY_DIAGNOSTIC_MAX_EVENTS = 250;
   const MASTER_DIAGNOSTIC_MAX_EVENTS = 1000;
@@ -299,7 +300,7 @@
   let expeditionReportWaitStartedAt = 0;
   const POST_BATTLE_LOOT_WAIT_TIMEOUT_MS = 15000;
   const postBattleLootLifecycle = { expedition: null, dungeon: null };
-  const VALID_TABS = new Set(["equipment", "auctions", "combat", "stat-priority", "diagnostics", "settings"]);
+  const VALID_TABS = new Set(["equipment", "auctions", "combat", "farming", "stat-priority", "diagnostics", "settings"]);
   const AUCTION_TIMING = Object.freeze({
     categorySettleMs: 1000,
     categoryJitterMs: 300,
@@ -314,6 +315,7 @@
   let combatOpponentFilter = "all";
   let combatWindowFilter = "all";
   let simulatorState = { reportId: null, simulations: 500, seed: 1, lifeMode: "current", statOverrides: {}, equipmentSelections: {}, result: null };
+  let farmingAdvisorState = { countryKey: "", scope: "current-accessible", simulations: 1000, seed: 1, minWinRate: 99, hpThresholdPercent: 30, busy: false, cancelRequested: false, result: null, error: null, progress: null };
   let statPriorityState = { mode: "turma", investment: 1, simulations: 50, seed: 1, training: null, result: null, manualAdjustments: { health: 0, armour: 0, damageMin: 0, damageMax: 0, criticalAttack: 0, blockValue: 0, hardening: 0 }, manualResult: null, turmaRoles: {}, selectedCharacterDollId: null, busy: false, error: null };
   let resizeSaveTimer = null;
 
@@ -400,6 +402,7 @@
   function diagnosticKey() { return `diagnostic:v0.2.5.13:${hostnameKey()}`; }
   function combatKey() { return `${COMBAT_STORAGE_PREFIX}${hostnameKey()}`; }
   function simulatorStateKey() { return `${SIMULATOR_STATE_PREFIX}${hostnameKey()}`; }
+  function farmingAdvisorStateKey() { return `${FARMING_ADVISOR_STORAGE_PREFIX}${hostnameKey()}`; }
   function statPriorityStateKey() { return `${STAT_PRIORITY_STORAGE_PREFIX}${hostnameKey()}`; }
   function statPriorityDiagnosticKey() { return `${STAT_PRIORITY_DIAGNOSTIC_PREFIX}${hostnameKey()}`; }
   function currentStatsSnapshotKey() { return `${CURRENT_STATS_STORAGE_PREFIX}${hostnameKey()}`; }
@@ -3318,6 +3321,7 @@
     circusCombatStore = { schemaVersion: 1, reports: [], updatedAt: null };
     renderCombatCaptureStatus();
     renderCombatTab();
+    renderFarmingAdvisorTab();
     renderStatPriorityTab();
     if (statusEl) statusEl.textContent = "Captured combat battles cleared.";
   }
@@ -15630,6 +15634,324 @@
     shadow.querySelector("#ga-equipment-status").textContent = "Saved equipment cleared.";
   }
 
+
+  function farmingAdvisorEngine() { return globalThis.GladiatusFarmingAdvisor || null; }
+  function farmingAdvisorCountryKeyDefault() {
+    return farmingAdvisorState.countryKey || detectCurrentExpeditionCountry()?.countryKey || "italy";
+  }
+
+  function persistFarmingAdvisorValue(value) {
+    if (typeof value === "number") {
+      if (Number.isNaN(value)) return "__GA_NONFINITE_NAN__";
+      if (value === Infinity) return "__GA_NONFINITE_INFINITY__";
+      if (value === -Infinity) return "__GA_NONFINITE_NEG_INFINITY__";
+      return value;
+    }
+    if (Array.isArray(value)) return value.map(persistFarmingAdvisorValue);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [key, entry] of Object.entries(value)) out[key] = persistFarmingAdvisorValue(entry);
+      return out;
+    }
+    return value;
+  }
+
+  function restoreFarmingAdvisorValue(value) {
+    if (value === "__GA_NONFINITE_NAN__") return NaN;
+    if (value === "__GA_NONFINITE_INFINITY__") return Infinity;
+    if (value === "__GA_NONFINITE_NEG_INFINITY__") return -Infinity;
+    if (Array.isArray(value)) return value.map(restoreFarmingAdvisorValue);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [key, entry] of Object.entries(value)) out[key] = restoreFarmingAdvisorValue(entry);
+      return out;
+    }
+    return value;
+  }
+
+  async function loadFarmingAdvisorState() {
+    try {
+      const key = farmingAdvisorStateKey();
+      const stored = (await storageGet(key))?.[key];
+      if (stored && typeof stored === "object") {
+        farmingAdvisorState = {
+          ...farmingAdvisorState,
+          ...stored,
+          countryKey: String(stored.countryKey || ""),
+          scope: ["current-accessible", "current-country", "all-countries"].includes(String(stored.scope)) ? String(stored.scope) : "current-accessible",
+          simulations: Math.max(1, Math.min(10000, Number(stored.simulations) || 1000)),
+          seed: Math.max(1, Math.trunc(Number(stored.seed) || 1)),
+          minWinRate: Math.max(0, Math.min(100, Number.isFinite(Number(stored.minWinRate)) ? Number(stored.minWinRate) : 99)),
+          hpThresholdPercent: Math.max(0, Math.min(100, Number.isFinite(Number(stored.hpThresholdPercent)) ? Number(stored.hpThresholdPercent) : Number(settings?.automation?.minimumHpThresholdPercent ?? 30))),
+          busy: false,
+          cancelRequested: false,
+          result: stored.result ? restoreFarmingAdvisorValue(stored.result) : null,
+          error: null,
+          progress: null
+        };
+        // A page/menu navigation destroys the running content script, so never
+        // restore a stale "busy" state. A completed or partial result, however,
+        // remains visible until the user explicitly starts another simulation.
+      }
+    } catch (_) {}
+    if (!farmingAdvisorState.countryKey) farmingAdvisorState.countryKey = farmingAdvisorCountryKeyDefault();
+    if (!Number.isFinite(Number(farmingAdvisorState.hpThresholdPercent))) farmingAdvisorState.hpThresholdPercent = Number(settings?.automation?.minimumHpThresholdPercent ?? 30);
+    farmingAdvisorState.hpThresholdPercent = Math.max(0, Math.min(100, Math.trunc(Number(farmingAdvisorState.hpThresholdPercent) || 0)));
+    return farmingAdvisorState;
+  }
+
+  async function saveFarmingAdvisorState() {
+    try {
+      const key = farmingAdvisorStateKey();
+      await storageSet({ [key]: {
+        schemaVersion: 2,
+        countryKey: farmingAdvisorState.countryKey,
+        scope: farmingAdvisorState.scope,
+        simulations: farmingAdvisorState.simulations,
+        seed: farmingAdvisorState.seed,
+        minWinRate: farmingAdvisorState.minWinRate,
+        hpThresholdPercent: farmingAdvisorState.hpThresholdPercent,
+        result: persistFarmingAdvisorValue(farmingAdvisorState.result),
+        updatedAt: new Date().toISOString()
+      }});
+    } catch (_) {}
+  }
+
+  function farmingAdvisorPlayerProfile() {
+    const engine = simulatorEngine();
+    const main = characterProfileStore.characters?.["1"] || null;
+    if (!engine || !main) return { engine, profile: null, missing: ["saved main-character profile"] };
+    const missing = characterProfileMissingSimulationData(main);
+    if (missing.length) return { engine, profile: null, missing };
+    const stats = { ...(main.stats || {}), name: main.name || main.stats?.name || "Main Character" };
+    const profile = engine.buildProfileFromSnapshot(main.equipment || {}, stats, {
+      baseStats: characterProfileBaseStats(main),
+      name: stats.name,
+      recalculateDerived: false
+    });
+    profile.name = stats.name;
+    profile.lifeCurrent = profile.lifeMax;
+    return { engine, profile, missing: [] };
+  }
+
+  function farmingAdvisorTargetCatalog() {
+    const catalog = expeditionEnemyCatalog();
+    const countryKey = farmingAdvisorState.countryKey || farmingAdvisorCountryKeyDefault();
+    const scope = String(farmingAdvisorState.scope || "current-accessible");
+    if (scope === "all-countries") return catalog;
+    const countryTargets = catalog.filter(row => row.countryKey === countryKey);
+    if (scope === "current-country") return countryTargets;
+    const detected = detectCurrentExpeditionCountry();
+    if (!detected || detected.countryKey !== countryKey) return [];
+    const accessible = getCurrentCountryAccessibleLocations(countryKey);
+    const accessibleNames = new Set(accessible.map(row => normalizeExpeditionLocationName(row.name)));
+    return countryTargets.filter(row => accessibleNames.has(normalizeExpeditionLocationName(row.expeditionName)));
+  }
+
+  function farmingAdvisorScopeLabel() {
+    if (farmingAdvisorState.scope === "all-countries") return "All database locations";
+    if (farmingAdvisorState.scope === "current-country") return `${EXPEDITION_COUNTRIES[farmingAdvisorState.countryKey]?.name || farmingAdvisorState.countryKey} · all locations`;
+    return `${EXPEDITION_COUNTRIES[farmingAdvisorState.countryKey]?.name || farmingAdvisorState.countryKey} · currently available locations`;
+  }
+
+  function farmingAdvisorNumber(value, digits = 1) {
+    if (!Number.isFinite(Number(value))) return "∞";
+    const n = Number(value);
+    return digits === 0 ? Math.round(n).toLocaleString() : n.toFixed(digits);
+  }
+
+  function farmingAdvisorResultRows(results) {
+    const rows = Array.isArray(results) ? results : [];
+    if (!rows.length) return `<div class="ga-muted" style="padding:10px 4px">No farming simulations completed yet.</div>`;
+    const body = rows.map((row, index) => {
+      const eligible = Number(row.winRate) >= Number(farmingAdvisorState.minWinRate);
+      const score = Number.isFinite(Number(row.riskAdjustedEfficiency)) ? farmingAdvisorNumber(row.riskAdjustedEfficiency, 2) : "∞";
+      return `<tr class="${eligible ? "" : "ga-farming-ineligible"}"><td>${index + 1}</td><td><strong>${esc(row.name)}</strong><small>${esc(row.isBoss ? "Boss" : row.expeditionName)}</small></td><td>${esc(farmingAdvisorNumber(row.winRate, 2))}%</td><td>${esc(farmingAdvisorNumber(row.averageDamageTaken, 1))}</td><td>${esc(farmingAdvisorNumber(row.sustainableFights, 2))}</td><td>${esc(score)}</td></tr>`;
+    }).join("");
+    return `<div class="ga-table-wrap"><table class="ga-farming-table"><thead><tr><th>#</th><th>Target</th><th>Win</th><th>Avg HP lost</th><th>Fights / HP cycle</th><th>Risk-adjusted</th></tr></thead><tbody>${body}</tbody></table></div>`;
+  }
+
+  function renderFarmingAdvisorTab() {
+    const root = shadow?.querySelector("#ga-farming-tab-content");
+    if (!root) return;
+    const countries = Object.entries(EXPEDITION_COUNTRIES);
+    const targets = farmingAdvisorTargetCatalog();
+    const engineAvailable = !!farmingAdvisorEngine();
+    const player = farmingAdvisorPlayerProfile();
+    const result = farmingAdvisorState.result;
+    const ranked = result?.ranking?.ranked || result?.partialResults || [];
+    const recommendation = result?.ranking?.recommended || null;
+    const recommendationEligible = !!recommendation && Number(recommendation.winRate) >= Number(farmingAdvisorState.minWinRate);
+    const detectedCountry = detectCurrentExpeditionCountry()?.countryKey || "";
+    const busy = !!farmingAdvisorState.busy;
+    const scopeNote = farmingAdvisorState.scope === "current-accessible" && farmingAdvisorState.countryKey !== detectedCountry
+      ? "Select the country currently open in the expedition map, or switch Scope to All locations in selected country."
+      : `${targets.length} target${targets.length === 1 ? "" : "s"} currently selected · ${targets.length * farmingAdvisorState.simulations} simulated battles.`;
+
+    root.innerHTML = `
+      <section class="ga-card">
+        <div class="ga-card-head"><div><h2>Farming Advisor</h2><div class="ga-muted">Uses the existing DinoDevs battle simulator against randomized expedition enemy profiles to rank sustainable farming targets. v1 optimizes combat efficiency only; gold, XP and loot are not yet included.</div></div></div>
+        <div class="ga-farming-controls">
+          <label>Country <select id="ga-farming-country">${countries.map(([key, country]) => `<option value="${esc(key)}" ${farmingAdvisorState.countryKey === key ? "selected" : ""}>${esc(country.name)}${detectedCountry === key ? " · current" : ""}</option>`).join("")}</select></label>
+          <label>Scope <select id="ga-farming-scope"><option value="current-accessible" ${farmingAdvisorState.scope === "current-accessible" ? "selected" : ""}>Currently available locations</option><option value="current-country" ${farmingAdvisorState.scope === "current-country" ? "selected" : ""}>All locations in selected country</option><option value="all-countries" ${farmingAdvisorState.scope === "all-countries" ? "selected" : ""}>All database locations</option></select></label>
+          <label>Simulations / target <input id="ga-farming-simulations" type="number" min="100" max="10000" step="100" value="${esc(farmingAdvisorState.simulations)}"></label>
+          <label>Minimum win rate <input id="ga-farming-winrate" type="number" min="0" max="100" step="0.1" value="${esc(farmingAdvisorState.minWinRate)}"></label>
+          <label>HP stop threshold <input id="ga-farming-hp-threshold" type="number" min="0" max="100" step="1" value="${esc(farmingAdvisorState.hpThresholdPercent)}"></label>
+          <label>Seed <input id="ga-farming-seed" type="number" min="1" step="1" value="${esc(farmingAdvisorState.seed)}"></label>
+        </div>
+        <div class="ga-muted" style="margin-top:6px">${esc(scopeNote)} Risk-adjusted efficiency = usable HP before the threshold ÷ average HP lost, multiplied by simulated win probability. Higher is better.</div>
+        <div class="ga-actions-row" style="margin-top:8px"><button class="ga-primary" id="ga-farming-run" type="button"${busy || !engineAvailable || !player.profile ? " disabled" : ""}>${busy ? "Analyzing…" : "Analyze Farming Spots"}</button>${busy ? `<button class="ga-secondary" id="ga-farming-stop" type="button">Stop after current target</button>` : ""}<span class="ga-statusline" id="ga-farming-status">${esc(farmingAdvisorState.error || (busy ? (farmingAdvisorState.progress?.message || "Running…") : "Ready."))}</span></div>
+        <div class="ga-farming-progress" id="ga-farming-progress"${busy ? "" : " hidden"}>${esc(farmingAdvisorState.progress?.message || "")}</div>
+      </section>
+      ${!engineAvailable ? `<section class="ga-card"><div class="ga-muted">Combat simulator engine is unavailable.</div></section>` : ""}
+      ${player.missing?.length ? `<section class="ga-card"><div class="ga-muted">Complete Current Stats and equipment capture before running the Farming Advisor. Missing: ${esc(player.missing.join(", "))}</div></section>` : ""}
+      ${recommendation ? `<section class="ga-card"><div class="ga-card-head"><div><h2>${recommendationEligible ? "Recommended farming target" : "Best available target"}</h2><div class="ga-muted">${esc(farmingAdvisorScopeLabel())}${recommendationEligible ? "" : ` · below ${esc(farmingAdvisorNumber(farmingAdvisorState.minWinRate, 1))}% minimum win rate`}</div></div><span class="ga-combat-result ${recommendationEligible ? "win" : "loss"}">${esc(farmingAdvisorNumber(recommendation.winRate, 2))}% win</span></div><div class="ga-farming-recommendation"><strong>${esc(recommendation.name)}</strong><span>${esc(recommendation.expeditionName)} · ${esc(farmingAdvisorNumber(recommendation.averageDamageTaken, 1))} avg HP lost · ${esc(farmingAdvisorNumber(recommendation.sustainableFights, 2))} fights / HP cycle · ${esc(farmingAdvisorNumber(recommendation.riskAdjustedEfficiency, 2))} risk-adjusted</span></div></section>` : ""}
+      ${(result || ranked.length) ? `<section class="ga-card"><div class="ga-card-head"><div><h2>Farming rankings</h2><div class="ga-muted">Targets below the minimum win-rate requirement remain visible but are ranked after eligible targets.</div></div>${result?.cancelled ? `<span class="ga-pill">Partial</span>` : ""}</div>${farmingAdvisorResultRows(ranked)}</section>` : ""}
+    `;
+
+    root.querySelector("#ga-farming-country")?.addEventListener("change", async event => {
+      farmingAdvisorState.countryKey = String(event.target.value || "");
+      farmingAdvisorState.result = null;
+      farmingAdvisorState.error = null;
+      await saveFarmingAdvisorState();
+      renderFarmingAdvisorTab();
+    });
+    root.querySelector("#ga-farming-scope")?.addEventListener("change", async event => {
+      farmingAdvisorState.scope = String(event.target.value || "current-accessible");
+      farmingAdvisorState.result = null;
+      farmingAdvisorState.error = null;
+      await saveFarmingAdvisorState();
+      renderFarmingAdvisorTab();
+    });
+    const saveNumeric = async (selector, key, min, max, fallback) => {
+      const input = root.querySelector(selector);
+      if (!input) return;
+      const n = Number(input.value);
+      farmingAdvisorState[key] = Number.isFinite(n) ? Math.max(min, Math.min(max, key === "simulations" || key === "seed" ? Math.trunc(n) : n)) : fallback;
+      farmingAdvisorState.result = null;
+      farmingAdvisorState.error = null;
+      await saveFarmingAdvisorState();
+      renderFarmingAdvisorTab();
+    };
+    root.querySelector("#ga-farming-simulations")?.addEventListener("change", () => void saveNumeric("#ga-farming-simulations", "simulations", 100, 10000, 1000));
+    root.querySelector("#ga-farming-winrate")?.addEventListener("change", () => void saveNumeric("#ga-farming-winrate", "minWinRate", 0, 100, 99));
+    root.querySelector("#ga-farming-hp-threshold")?.addEventListener("change", () => void saveNumeric("#ga-farming-hp-threshold", "hpThresholdPercent", 0, 100, 30));
+    root.querySelector("#ga-farming-seed")?.addEventListener("change", () => void saveNumeric("#ga-farming-seed", "seed", 1, Number.MAX_SAFE_INTEGER, 1));
+    root.querySelector("#ga-farming-stop")?.addEventListener("click", () => {
+      farmingAdvisorState.cancelRequested = true;
+      farmingAdvisorState.error = "Stopping after the current target…";
+      updateFarmingAdvisorProgress("Stopping after the current target…");
+    });
+    root.querySelector("#ga-farming-run")?.addEventListener("click", () => void runFarmingAdvisor());
+  }
+
+  function updateFarmingAdvisorProgress(message) {
+    const text = String(message || "");
+    const status = shadow?.querySelector("#ga-farming-status");
+    const progress = shadow?.querySelector("#ga-farming-progress");
+    if (status) status.textContent = text;
+    if (progress) { progress.hidden = !text; progress.textContent = text; }
+  }
+
+  async function runFarmingAdvisor() {
+    if (farmingAdvisorState.busy) return;
+    const advisor = farmingAdvisorEngine();
+    const playerContext = farmingAdvisorPlayerProfile();
+    if (!advisor || !playerContext.engine) {
+      farmingAdvisorState.error = "Combat simulator engine unavailable.";
+      renderFarmingAdvisorTab();
+      return;
+    }
+    if (!playerContext.profile) {
+      farmingAdvisorState.error = `Saved main-character profile is unavailable or incomplete. Missing: ${playerContext.missing.join(", ") || "profile data"}. Capture All Characters again.`;
+      renderFarmingAdvisorTab();
+      return;
+    }
+    const targets = farmingAdvisorTargetCatalog();
+    if (!targets.length) {
+      farmingAdvisorState.error = farmingAdvisorState.scope === "current-accessible"
+        ? "No currently accessible locations were detected for the selected country. Open that country's expedition map or choose another scope."
+        : "No expedition targets were found in the selected database scope.";
+      farmingAdvisorState.result = null;
+      renderFarmingAdvisorTab();
+      return;
+    }
+
+    farmingAdvisorState.busy = true;
+    farmingAdvisorState.cancelRequested = false;
+    farmingAdvisorState.error = null;
+    farmingAdvisorState.progress = { completedTargets: 0, totalTargets: targets.length, currentTarget: null, simulations: farmingAdvisorState.simulations, message: `Preparing ${targets.length} target${targets.length === 1 ? "" : "s"}…` };
+    farmingAdvisorState.result = { results: [], partialResults: [], ranking: null, cancelled: false, startedAt: new Date().toISOString(), scope: farmingAdvisorScopeLabel() };
+    await saveFarmingAdvisorState();
+    renderFarmingAdvisorTab();
+
+    try {
+      const started = Date.now();
+      for (let index = 0; index < targets.length; index++) {
+        const target = targets[index];
+        if (farmingAdvisorState.cancelRequested && index > 0) {
+          farmingAdvisorState.result.cancelled = true;
+          break;
+        }
+        farmingAdvisorState.progress.currentTarget = target.name;
+        farmingAdvisorState.progress.message = `Analyzing ${index + 1}/${targets.length}: ${target.expeditionName} · ${target.name}`;
+        updateFarmingAdvisorProgress(farmingAdvisorState.progress.message);
+        const targetResult = await advisor.simulateTargetBatchAsync({
+          engine: playerContext.engine,
+          player: playerContext.profile,
+          target,
+          simulations: farmingAdvisorState.simulations,
+          seed: farmingAdvisorState.seed,
+          maxRounds: 50,
+          chunkSize: 25,
+          playerLifeMax: playerContext.profile.lifeMax,
+          hpThresholdPercent: farmingAdvisorState.hpThresholdPercent,
+          onProgress: info => {
+            if (!info) return;
+            const pct = Number(info.total) ? Math.floor(Number(info.completed) / Number(info.total) * 100) : 0;
+            const text = `Analyzing ${index + 1}/${targets.length}: ${target.expeditionName} · ${target.name} · ${pct}%`;
+            farmingAdvisorState.progress.message = text;
+            updateFarmingAdvisorProgress(text);
+          },
+          onYield: () => {}
+        });
+        farmingAdvisorState.result.results.push(targetResult);
+        farmingAdvisorState.result.partialResults = advisor.sortResults(farmingAdvisorState.result.results);
+        farmingAdvisorState.result.ranking = advisor.rankResults(farmingAdvisorState.result.results, farmingAdvisorState.minWinRate);
+        farmingAdvisorState.progress.completedTargets = index + 1;
+        await saveFarmingAdvisorState();
+        const elapsed = Math.max(0.001, (Date.now() - started) / 1000);
+        const perTarget = elapsed / Math.max(1, index + 1);
+        const remaining = Math.max(0, targets.length - index - 1);
+        farmingAdvisorState.progress.message = `Completed ${index + 1}/${targets.length} · ~${Math.ceil(perTarget * remaining)}s remaining`;
+        renderFarmingAdvisorTab();
+        if (farmingAdvisorState.cancelRequested) {
+          farmingAdvisorState.result.cancelled = true;
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      const results = farmingAdvisorState.result.results || [];
+      farmingAdvisorState.result.partialResults = advisor.sortResults(results);
+      farmingAdvisorState.result.ranking = advisor.rankResults(results, farmingAdvisorState.minWinRate);
+      farmingAdvisorState.result.completedAt = new Date().toISOString();
+      farmingAdvisorState.busy = false;
+      farmingAdvisorState.progress = null;
+      if (farmingAdvisorState.cancelRequested) farmingAdvisorState.result.cancelled = true;
+      farmingAdvisorState.cancelRequested = false;
+      farmingAdvisorState.error = results.length && !farmingAdvisorState.result.ranking.recommended ? "No suitable farming target was found." : null;
+      await saveFarmingAdvisorState();
+      renderFarmingAdvisorTab();
+    } catch (error) {
+      farmingAdvisorState.busy = false;
+      farmingAdvisorState.progress = null;
+      farmingAdvisorState.cancelRequested = false;
+      farmingAdvisorState.error = error?.message || String(error);
+      await saveFarmingAdvisorState();
+      renderFarmingAdvisorTab();
+    }
+  }
+
   function switchTab(name) {
     if (!VALID_TABS.has(name)) return;
     removeHoverTooltip();
@@ -15639,6 +15961,7 @@
     void saveActiveTab(name);
     shadow.querySelectorAll(".ga-tab").forEach(btn => btn.classList.toggle("active", btn.dataset.tab === name));
     shadow.querySelectorAll(".ga-tab-panel").forEach(section => section.classList.toggle("active", section.dataset.panel === name));
+    if (name === "farming") renderFarmingAdvisorTab();
     if (name === "stat-priority") renderStatPriorityTab();
     if (name === "diagnostics") renderDiagnosticCaptureControls();
   }
@@ -15828,7 +16151,7 @@
     style.textContent = `
       :host,*{box-sizing:border-box}.ga-panel{position:relative;width:600px;min-width:420px;min-height:420px;max-width:calc(100vw - 18px);max-height:calc(100vh - 18px);resize:both;overflow:auto;pointer-events:auto;color:#f3f4f6;font:12px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#111827;border:1px solid #475569;border-radius:12px;box-shadow:0 14px 40px rgba(0,0,0,.45)}
       .ga-header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:9px 10px;background:#1f2937;border-radius:11px 11px 0 0;cursor:move;position:sticky;top:0;z-index:5}.ga-title{font-size:14px;font-weight:800}.ga-status{color:#94a3b8;font-size:9px;margin-top:2px}.ga-actions{display:flex;gap:4px}.ga-btn{border:1px solid #475569;background:#374151;color:#e5e7eb;border-radius:6px;min-width:24px;height:24px;cursor:pointer;font-weight:800}.ga-btn:hover{background:#4b5563}.ga-body{padding:10px}.ga-panel.ga-minimized{width:220px;min-width:220px;min-height:0;height:auto;resize:none}.ga-panel.ga-minimized .ga-header{border-radius:11px}
-      .ga-tabs{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:4px;margin-bottom:9px;padding:4px;background:#1f2937;border-radius:9px}.ga-tab{border:0;background:transparent;color:#9ca3af;border-radius:7px;padding:7px 6px;cursor:pointer;font-weight:700;font-size:10px}.ga-tab:hover{background:#374151;color:#e5e7eb}.ga-tab.active{background:#d1d5db;color:#111827}.ga-tab-panel{display:none}.ga-tab-panel.active{display:block}
+      .ga-tabs{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;margin-bottom:9px;padding:4px;background:#1f2937;border-radius:9px}.ga-tab{border:0;background:transparent;color:#9ca3af;border-radius:7px;padding:7px 6px;cursor:pointer;font-weight:700;font-size:10px}.ga-tab:hover{background:#374151;color:#e5e7eb}.ga-tab.active{background:#d1d5db;color:#111827}.ga-tab-panel{display:none}.ga-tab-panel.active{display:block}
       .ga-card{background:#1f2937;border-radius:10px;padding:10px;margin-top:9px}.ga-card:first-child{margin-top:0}.ga-card-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.ga-card h2{font-size:13px;margin:0 0 7px}.ga-actions-row{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.ga-secondary,.ga-primary{border:1px solid #475569;border-radius:7px;padding:6px 8px;cursor:pointer;font-weight:700;font-size:10px}.ga-primary{background:#d1d5db;color:#111827}.ga-secondary{background:#374151;color:#e5e7eb}.ga-secondary:hover{background:#4b5563}.ga-muted{color:#94a3b8;font-size:10px}.ga-statusline{margin-bottom:7px;color:#94a3b8;font-size:9px}.ga-character-switcher{display:grid;grid-template-columns:34px minmax(0,1fr) 34px;gap:5px;align-items:center;margin:8px 0}.ga-character-cycle{height:28px;min-width:34px;padding:4px 6px;border:1px solid #475569;border-radius:7px;background:#374151;color:#e5e7eb;cursor:pointer;font-weight:900;font-size:14px;line-height:1}.ga-character-cycle:hover:not(:disabled){background:#4b5563}.ga-character-cycle:disabled{opacity:.4;cursor:default}.ga-character-current{min-width:0;padding:6px 8px;border:1px solid #334155;border-radius:7px;background:#111827;text-align:center;color:#e5e7eb;font-size:10px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .ga-stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.ga-subsection-title{font-size:12px;margin:10px 0 7px;color:#e5e7eb}.ga-auto-module{border-top:1px solid #374151;padding:8px 0}.ga-auto-module:first-of-type{border-top:0}.ga-auto-module-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.ga-check{display:flex;align-items:center;gap:7px;color:#e5e7eb;font-size:12px}.ga-check input{width:14px;height:14px}.ga-auto-combat-options{display:grid;grid-template-columns:110px 1fr 110px;gap:7px}.ga-auto-combat-options label{display:flex;flex-direction:column;gap:4px;color:#cbd5e1;font-size:10px;font-weight:700}.ga-auto-combat-options select,.ga-auto-combat-options input{width:100%;border:1px solid #475569;border-radius:7px;background:#111827;color:#e5e7eb;padding:6px 7px;font:inherit} .ga-auto-expedition-grid{display:grid;grid-template-columns:1fr 110px;gap:7px;margin-top:8px}.ga-auto-expedition-grid label{display:flex;flex-direction:column;gap:4px;color:#cbd5e1;font-size:10px;font-weight:700}.ga-auto-expedition-grid select,.ga-auto-expedition-grid input{width:100%;border:1px solid #475569;border-radius:7px;background:#111827;color:#e5e7eb;padding:6px 7px;font:inherit}.ga-stat{background:#111827;border-radius:7px;padding:7px 8px;display:flex;justify-content:space-between;gap:8px}.ga-stat strong{font-weight:800}.ga-target:first-child{border-top:0;padding-top:0}.ga-target-title{font-weight:800;margin-bottom:5px}.ga-row{display:flex;justify-content:space-between;gap:8px;font-size:10px;margin:3px 0}.ga-arena-analysis-list{border:1px solid #334155;border-radius:7px;overflow:hidden}.ga-arena-analysis-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;align-items:center;padding:6px 7px;border-top:1px solid #334155;font-size:10px}.ga-arena-analysis-row:first-child{border-top:0}.ga-arena-analysis-row small{display:block;margin-top:2px}.ga-pill{display:inline-block;padding:2px 5px;background:#374151;border-radius:999px;font-size:8px}.ga-focus:first-child{border-top:0}.ga-focus strong{min-width:82px}.ga-focus span{color:#cbd5e1}
       ${itemGridCss()}
@@ -15837,6 +16160,7 @@
       .ga-stat-hoverable{cursor:help}.ga-stat-hoverable:hover,.ga-stat-hoverable:focus-visible{border:1px solid #64748b;outline:none}.ga-stat-tooltip{position:fixed;z-index:2147483647;width:235px;max-width:300px;padding:8px 9px;border:1px solid #64748b;border-radius:8px;background:#0f172a;color:#e5e7eb;box-shadow:0 10px 28px rgba(0,0,0,.55);pointer-events:none;font-size:10px;line-height:1.2}.ga-stat-tooltip-title{font-size:11px;font-weight:900;margin-bottom:6px}.ga-stat-tooltip-row{display:flex;justify-content:space-between;gap:10px;padding:3px 0}.ga-stat-tooltip-row strong{color:#f8fafc}      .ga-diag-pills{display:flex;flex-wrap:wrap;gap:5px}.ga-diag-pill{background:#111827;color:#cbd5e1;border:1px solid #374151;border-radius:999px;padding:3px 6px;font-size:8px}.ga-diag-pill b{font-weight:800}.ga-diagnostic-pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:8px;line-height:1.35;color:#94a3b8;background:#0f172a;border-radius:7px;padding:8px;max-height:300px;overflow:auto}.ga-icon-preview{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin-top:7px}.ga-preview{background:#0f172a;border:1px solid #334155;border-radius:7px;padding:4px;text-align:center;min-width:0}.ga-preview img,.ga-preview-missing{width:40px;height:40px;display:block;object-fit:contain;margin:0 auto;background:#111827;border-radius:5px}.ga-preview-missing{display:flex;align-items:center;justify-content:center;color:#64748b}.ga-preview-slot{margin-top:3px;color:#94a3b8;font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       .ga-auction-controls{position:relative}.ga-auction-scan-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:50;width:260px;background:#0f172a;border:1px solid #475569;border-radius:9px;box-shadow:0 14px 30px rgba(0,0,0,.5);padding:8px}.ga-auction-menu-title{font-weight:800;font-size:10px;margin-bottom:6px}.ga-auction-menu-list{display:grid;grid-template-columns:1fr 1fr;gap:4px 8px;max-height:280px;overflow:auto}.ga-auction-menu-list label{display:flex;align-items:center;gap:5px;font-size:9px;color:#cbd5e1;padding:3px 0}.ga-auction-menu-actions{display:flex;justify-content:flex-end;gap:5px;margin-top:7px;padding-top:7px;border-top:1px solid #334155}.ga-auction-toolbar{display:flex;align-items:center;justify-content:flex-start;flex-wrap:wrap;gap:7px;margin-top:8px;position:relative}.ga-auction-toolbar label{display:flex;align-items:center;gap:6px;font-size:9px;color:#cbd5e1}.ga-auction-toolbar select{padding:5px 7px;border-radius:6px;border:1px solid #475569;background:#111827;color:#e5e7eb;font-size:9px}.ga-auction-affix-control{position:relative}.ga-auction-affix-toggle{white-space:nowrap}.ga-auction-affix-menu{position:absolute;left:0;top:calc(100% + 5px);z-index:60;width:270px;padding:8px;background:#0f172a;border:1px solid #475569;border-radius:9px;box-shadow:0 14px 32px rgba(0,0,0,.55)}.ga-auction-affix-search{width:100%;padding:6px 7px;border-radius:6px;border:1px solid #475569;background:#111827;color:#f3f4f6;font-size:10px}.ga-auction-affix-count{margin-top:5px;color:#64748b;font-size:8px}.ga-auction-affix-options{display:flex;flex-direction:column;gap:2px;max-height:270px;overflow:auto;margin-top:5px;padding-right:2px}.ga-auction-affix-option{display:flex;align-items:center;gap:6px;padding:3px 4px;color:#cbd5e1;font-size:9px;border-radius:5px;cursor:pointer}.ga-auction-affix-option:hover{background:#172033}.ga-auction-affix-actions{display:flex;justify-content:flex-end;gap:5px;margin-top:7px;padding-top:7px;border-top:1px solid #334155}.ga-auction-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;max-height:min(58vh,520px);overflow:auto;padding-right:2px;margin-top:8px}.ga-auction-row{appearance:none;width:100%;min-width:0;display:grid;grid-template-columns:72px minmax(0,1fr);align-items:center;gap:8px;padding:6px 7px;background:#111827;border:1px solid #334155;border-radius:7px;color:#e5e7eb;cursor:pointer;text-align:left;box-sizing:border-box;box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ga-quality-color,#64748b) 70%,transparent)}.ga-auction-row:hover,.ga-auction-row:focus-visible{outline:none;border-color:var(--ga-quality-color,#64748b);background:#172033;transform:none}
       .ga-auction-row-main{min-width:0;display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:8px}.ga-auction-compare-badge{display:inline-flex;align-items:center;padding:3px 5px;border-radius:5px;font-size:8px;font-weight:900;white-space:nowrap;border:1px solid #475569}.ga-auction-compare-upgrade{color:#86efac;border-color:#166534;background:#052e16}.ga-auction-compare-sidegrade{color:#fde68a;border-color:#92400e;background:#451a03}.ga-auction-compare-pending{color:#93c5fd;border-color:#1d4ed8;background:#172554}.ga-auction-compare-stale{color:#fcd34d;border-color:#92400e;background:#451a03}.ga-auction-compare-error{color:#fca5a5;border-color:#991b1b;background:#450a0a}.ga-auction-compare-worse{color:#fca5a5;border-color:#991b1b;background:#450a0a}.ga-comparison-status{font-size:9px;font-weight:900;margin-top:3px}.ga-comparison-upgrade{color:#86efac}.ga-comparison-sidegrade{color:#fde68a}.ga-comparison-pending{color:#93c5fd}.ga-comparison-error{color:#fca5a5}.ga-comparison-worse{color:#fca5a5}.ga-auction-thumb{width:72px;height:72px;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#0f172a;border-radius:5px}.ga-auction-thumb img{display:block;object-fit:contain}.ga-auction-price{display:flex;align-items:center;gap:5px;font-size:12px}.ga-auction-price strong{font-size:12px}.ga-auction-gold{width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;flex:0 0 16px}.ga-auction-gold img{width:16px;height:16px;object-fit:contain;display:block}.ga-gold-fallback{width:14px;height:14px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;border:1px solid #d1a94c;color:#d1a94c;font-size:8px}.ga-auction-empty{padding:18px 8px;text-align:center;grid-column:1/-1}.ga-auction-progress{margin-top:6px;color:#94a3b8;font-size:9px}.ga-sim-controls{margin-top:8px}.ga-stat-priority-controls{margin-top:8px}.ga-stat-priority-cost-preview{display:flex;flex-wrap:wrap;gap:5px;align-items:center;font-size:9px;color:#cbd5e1}.ga-stat-priority-cost-preview>span{background:#111827;border:1px solid #334155;border-radius:5px;padding:4px 6px}.ga-stat-priority-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-bottom:8px}.ga-table-wrap{overflow:auto;border:1px solid #334155;border-radius:7px}.ga-stat-priority-table{width:100%;border-collapse:collapse;font-size:9px;background:#111827}.ga-stat-priority-table th{padding:6px 7px;text-align:left;color:#94a3b8;font-weight:800;background:#172033;white-space:nowrap}.ga-stat-priority-table td{padding:6px 7px;border-top:1px solid #273447;color:#e5e7eb;vertical-align:top}.ga-stat-priority-table td small{display:block;color:#94a3b8;font-size:8px;margin-top:2px}.ga-stat-priority-table td:nth-child(2),.ga-stat-priority-table td:nth-child(3),.ga-stat-priority-table td:nth-child(4),.ga-stat-priority-table td:nth-child(5){white-space:nowrap}.ga-stat-priority-manual-grid{margin-top:8px}.ga-manual-combined{margin-bottom:8px;padding:8px;border:1px solid #334155;border-radius:7px;background:#111827}.ga-manual-combined-title{font-weight:900;color:#e5e7eb;margin-bottom:7px}.ga-manual-combined-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;font-size:9px}.ga-manual-combined-grid span{color:#94a3b8}.ga-manual-combined-grid strong{color:#f8fafc}
+      .ga-farming-controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:8px}.ga-farming-controls label{display:flex;flex-direction:column;gap:4px;color:#cbd5e1;font-size:10px;font-weight:700}.ga-farming-controls select,.ga-farming-controls input{width:100%;border:1px solid #475569;border-radius:7px;background:#111827;color:#e5e7eb;padding:6px 7px;font:inherit}.ga-farming-progress{margin-top:7px;padding:6px 7px;border:1px solid #334155;border-radius:6px;background:#111827;color:#93c5fd;font-size:9px}.ga-farming-recommendation{display:flex;flex-direction:column;gap:4px;margin-top:8px;padding:8px;border:1px solid #166534;border-radius:7px;background:#052e16}.ga-farming-recommendation strong{font-size:12px}.ga-farming-recommendation span{color:#bbf7d0;font-size:9px}.ga-farming-table{width:100%;border-collapse:collapse;font-size:9px;background:#111827}.ga-farming-table th{padding:6px 7px;text-align:left;color:#94a3b8;font-weight:800;background:#172033;white-space:nowrap}.ga-farming-table td{padding:6px 7px;border-top:1px solid #273447;color:#e5e7eb;vertical-align:top}.ga-farming-table td small{display:block;color:#94a3b8;font-size:8px;margin-top:2px}.ga-farming-ineligible{opacity:.65}
       .ga-sim-two-col{display:grid;grid-template-columns:1fr 1fr;gap:8px}.ga-sim-two-col section{min-width:0}.ga-sim-two-col h3{font-size:10px;margin:0 0 6px;color:#cbd5e1}.ga-sim-profile-two{display:grid;grid-template-columns:1fr 1fr;gap:7px}.ga-sim-profile-three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.ga-sim-profile{background:#111827;border-radius:7px;padding:7px}.ga-sim-profile-title{font-weight:800;font-size:10px;margin-bottom:6px}.ga-sim-profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;font-size:8px;color:#cbd5e1}.ga-sim-result-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}.ga-sim-profile select,.ga-sim-profile input{max-width:100%}.ga-sim-result{background:#0f172a;border-radius:7px;padding:7px}.ga-sim-captured-profile{background:#0f172a;border:1px solid #475569;border-radius:7px;padding:7px}.ga-sim-two-col select{width:100%;padding:6px 7px;border-radius:6px;border:1px solid #475569;background:#111827;color:#e5e7eb;font-size:9px}.ga-sim-two-col input{box-sizing:border-box}.ga-primary:disabled,.ga-secondary:disabled{opacity:.55;cursor:wait}
       .ga-combat-diagnostic-pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:8px;line-height:1.35;color:#94a3b8;background:#0f172a;border-radius:7px;padding:8px;max-height:420px;overflow:auto}.ga-auction-diagnostic-pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:8px;line-height:1.35;color:#94a3b8;background:#0f172a;border-radius:7px;padding:8px;max-height:260px;overflow:auto}
       .ga-field-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.ga-field{display:flex;flex-direction:column;gap:3px;font-size:9px;color:#cbd5e1}.ga-field input,.ga-field select{width:100%;padding:6px;border-radius:6px;border:1px solid #475569;background:#111827;color:#f3f4f6;font-size:10px;box-sizing:border-box}.ga-field select{cursor:pointer}.ga-settings-section{margin-top:8px;padding-top:8px;border-top:1px solid #374151}.ga-settings-section:first-child{margin-top:0;padding-top:0;border-top:0}.ga-target-edit:first-child{border-top:0}.ga-settings-save{display:flex;justify-content:flex-end;gap:7px;align-items:center;margin-top:8px}.ga-settings-status{color:#a7f3d0;font-size:9px}
@@ -15858,6 +16182,7 @@
           <button class="ga-tab${activeTab === "equipment" ? " active" : ""}" data-tab="equipment" type="button">Character Overview</button>
           <button class="ga-tab${activeTab === "auctions" ? " active" : ""}" data-tab="auctions" type="button">Auctions</button>
           <button class="ga-tab${activeTab === "combat" ? " active" : ""}" data-tab="combat" type="button">Combat</button>
+          <button class="ga-tab${activeTab === "farming" ? " active" : ""}" data-tab="farming" type="button">Farming</button>
           <button class="ga-tab${activeTab === "stat-priority" ? " active" : ""}" data-tab="stat-priority" type="button">Stat Priority</button>
           <button class="ga-tab${activeTab === "diagnostics" ? " active" : ""}" data-tab="diagnostics" type="button">Diagnostics</button>
           <button class="ga-tab${activeTab === "settings" ? " active" : ""}" data-tab="settings" type="button">Settings</button>
@@ -15945,6 +16270,8 @@
         <section class="ga-tab-panel${activeTab === "combat" ? " active" : ""}" data-panel="combat">
           <div id="ga-combat-tab-content"></div>
         </section>
+        <section class="ga-tab-panel${activeTab === "farming" ? " active" : ""}" data-panel="farming"><div id="ga-farming-tab-content"></div></section>
+
         <section class="ga-tab-panel${activeTab === "stat-priority" ? " active" : ""}" data-panel="stat-priority">
           <div id="ga-stat-priority-tab-content"></div>
         </section>
@@ -16069,6 +16396,11 @@
     await loadSettings();
     await loadAutoCombatDiagnostics();
     await loadCharacterProfileStore();
+    // Re-render the active panel after the persisted character profile is
+    // available. Farming is rendered once during initial DOM setup, but the
+    // saved profile loads asynchronously; without this refresh its Analyze
+    // button can remain disabled after menu/page navigation.
+    if (activeTab === "farming") renderFarmingAdvisorTab();
     await loadCharacterSelection();
     await loadCurrentStatsSnapshot();
     renderSettings(); renderCharacterSelectors(); renderStats(); renderDiagnosticCaptureControls();
@@ -16086,6 +16418,10 @@
     nativeOpponentWinRateAutoAnalysisReady = true;
     scheduleNativeOpponentWinRateAutoAnalysis({ force: true });
     await loadSimulatorState();
+    await loadFarmingAdvisorState();
+    // Restore persisted Farming Advisor results and controls only after both
+    // the farming state and character profile have finished loading.
+    if (activeTab === "farming") renderFarmingAdvisorTab();
     await loadStatPriorityDiagnostics();
     await loadStatPriorityState();
     await loadAuctionComparisonResults();
